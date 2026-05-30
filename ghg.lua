@@ -1464,4 +1464,4 @@ parallel.waitForAll(
     cameraLoop,
     rwrRedstoneLoop,
     iffToggleLoop
-)
+) end
