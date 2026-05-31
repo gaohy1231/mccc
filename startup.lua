@@ -597,11 +597,13 @@ if isActive and localPos then
         if t and t.s then
             local targetData = t.id and targets[t.id]
             if targetData then
-                -- 方向线终点（从中心到雷达圆内边缘，留出文字空间）
+                -- 红色粗线测试
                 local lineLen = r - 12
                 local ex = cx + math_floor(lineLen * t.s + 0.5)
                 local ey = cy - math_floor(lineLen * t.cs + 0.5)
-                g.line(cx, cy, ex, ey, 0x0066FF)   -- 蓝色细线
+                for dy = -1, 1 do
+                    g.line(cx, cy+dy, ex, ey+dy, 0xFF0000)
+                end
 
                 -- 速度区间和径向符号
                 local speedStr = speedRangeStr(targetData.speed)
