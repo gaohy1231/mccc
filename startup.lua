@@ -244,10 +244,10 @@ end
 -- ==========================================
 local C = {
     BG          = 0x050A05,
-    OUTER_RING  = 0x00CC44,
-    INNER_RING  = 0x007722,
+    OUTER_RING  = 0xFFAA00,
+    INNER_RING  = 0xAA5500, 
     GRID        = 0x005518,
-    SWEEP       = 0x00FF66,
+    SWEEP       = 0x000000,  
     YELLOW      = 0xFFFF00,
     ALLY_HOT    = 0x44FFAA,
     FOE_HOT     = 0xFF6600,
@@ -599,11 +599,7 @@ if isActive and localPos then
             local lineLen = math.max(20, r - 12)
             local ex = cx + math_floor(lineLen * t.s + 0.5)
             local ey = cy - math_floor(lineLen * t.cs + 0.5)
-            -- 绘制加粗黄色方向线（3像素宽）
-            for dy = -1, 1 do
-                g.line(cx, cy+dy, ex, ey+dy, 0xFFFF00)
-            end
-
+            g.line(cx, cy, ex, ey, 0x0066FF)   -- 单像素蓝色线
             -- 速度区间和径向符号
             local speedStr = speedRangeStr(t.speed)
             local radialSym = radialSymbol(t.radialSpeed)
@@ -617,7 +613,7 @@ if isActive and localPos then
             local ty = ey - 12 * t.cs
             tx = math_max(1, math_min(entry.w - 1, tx))
             ty = math_max(1, math_min(entry.h - 1, ty))
-            pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
+            pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 0)
         end
     end
 end
@@ -768,38 +764,35 @@ local function hudMonitorUI()
                     rColor=colors.lime
                 if selectedTargetId and targets[selectedTargetId] then
                     local sel=targets[selectedTargetId]
-                    -- 准备速度字符串
+                    -- 计算方位角
+                    local absBearing = (sel.paintedYaw + 360) % 360
+                    local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
+                    local bearingStr = string.format(" %03d°/%03d°", relBearing, absBearing)
+                    -- 速度字符串（不变）
                     local speedStr = ""
                     if sel.speed then
-                       local radial = ""
-                       if sel.radialSpeed then
-                          if sel.radialSpeed > 0.5 then
-                              radial = " [A]"
-                          elseif sel.radialSpeed < -0.5 then
-                              radial = " [C]"
-                          else
-                              radial = " [=]"
-                          end
-                       end
-                       speedStr = string.format(" %.0fm/s%s", sel.speed, radial)
+                        local radial = ""
+                        if sel.radialSpeed then
+                            if sel.radialSpeed > 0.5 then radial = " [A]"
+                            elseif sel.radialSpeed < -0.5 then radial = " [C]"
+                            else radial = " [=]" end
+                        end
+                        speedStr = string.format(" %.0fm/s%s", sel.speed, radial)
                     else
-                       speedStr = " ?m/s"
+                        speedStr = " ?m/s"
                     end
                     if sel.iff=="friendly" then
-                         lText="ALLY"; lColor=colors.green
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.green
+                        lText="ALLY"; lColor=colors.green
+                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.green
                     elseif sel.iff=="enemy" then
-                         lText="ENEMY"; lColor=colors.red
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.white
+                        lText="ENEMY"; lColor=colors.red
+                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
                     else
-                         lText="LOCKED"; lColor=colors.yellow
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.white
-                    end
-                    else
-                        lText="SCAN"; lColor=colors.lightGray
-                        dText="---";  dColor=colors.gray
+                        lText="LOCKED"; lColor=colors.yellow
+                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
                     end
                 end
+            end
                 if isFirstFrame or sText~=info.lastSText or rText~=info.lastRText
                     or lText~=info.lastLText or dText~=info.lastDText
                     or iffMode~=info.lastIffMode
