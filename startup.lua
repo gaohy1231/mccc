@@ -592,37 +592,16 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
     gpuDrawRadarBase(entry)
     gpuDrawRwrArcs(entry)
 if isActive and localPos then
+    -- 测试：画一个十字
+    g.line(cx-10, cy, cx+10, cy, 0x00FF00)
+    g.line(cx, cy-10, cx, cy+10, 0x00FF00)
     for i=1,poolCount do
         local t=pool[i]
         if t and t.s then
-            local targetData = t.id and targets[t.id]
-            if targetData then
-                -- 红色粗线测试
-                local lineLen = r - 12
-                local ex = cx + math_floor(lineLen * t.s + 0.5)
-                local ey = cy - math_floor(lineLen * t.cs + 0.5)
-                for dy = -1, 1 do
-                    g.line(cx, cy+dy, ex, ey+dy, 0xFF0000)
-                end
-
-                -- 速度区间和径向符号
-                local speedStr = speedRangeStr(targetData.speed)
-                local radialSym = radialSymbol(targetData.radialSpeed)
-
-                -- 方位角（度）
-                local absBearing = (targetData.paintedYaw + 360) % 360
-                local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
-
-                -- 文本：速度区间+符号 相对方位 绝对方位
-                local text = string.format("%s%s %03d° %03d°", speedStr, radialSym, relBearing, absBearing)
-
-                -- 文本位置：沿射线方向再偏移 12 像素，并限制边界
-                local tx = ex + 12 * t.s
-                local ty = ey - 12 * t.cs
-                tx = math_max(1, math_min(entry.w - 1, tx))
-                ty = math_max(1, math_min(entry.h - 1, ty))
-                pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
-            end
+            -- 临时固定线长 50
+            local ex = cx + math_floor(50 * t.s + 0.5)
+            local ey = cy - math_floor(50 * t.cs + 0.5)
+            g.line(cx, cy, ex, ey, 0xFF0000)
         end
     end
 end
