@@ -592,16 +592,31 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
     gpuDrawRadarBase(entry)
     gpuDrawRwrArcs(entry)
 if isActive and localPos then
-    -- 测试：画一个十字
-    g.line(cx-10, cy, cx+10, cy, 0x00FF00)
-    g.line(cx, cy-10, cx, cy+10, 0x00FF00)
     for i=1,poolCount do
         local t=pool[i]
         if t and t.s then
-            -- 临时固定线长 50
-            local ex = cx + math_floor(50 * t.s + 0.5)
-            local ey = cy - math_floor(50 * t.cs + 0.5)
-            g.line(cx, cy, ex, ey, 0xFF0000)
+            local targetData = t.id and targets[t.id]
+            if targetData then
+                -- 安全线长：至少 20 像素，避免因半径太小导致线段消失
+                local lineLen = math.max(20, r - 12)
+                local ex = cx + math_floor(lineLen * t.s + 0.5)
+                local ey = cy - math_floor(lineLen * t.cs + 0.5)
+                -- 使用亮黄色粗线（3像素宽）
+                for dy = -1, 1 do
+                    g.line(cx, cy+dy, ex, ey+dy, 0xFFFF00)
+                end
+                -- 文字绘制（如果文字也不显示，可以暂时注释）
+                local speedStr = speedRangeStr(targetData.speed)
+                local radialSym = radialSymbol(targetData.radialSpeed)
+                local absBearing = (targetData.paintedYaw + 360) % 360
+                local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
+                local text = string.format("%s%s %03d° %03d°", speedStr, radialSym, relBearing, absBearing)
+                local tx = ex + 12 * t.s
+                local ty = ey - 12 * t.cs
+                tx = math_max(1, math_min(entry.w - 1, tx))
+                ty = math_max(1, math_min(entry.h - 1, ty))
+                pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
+            end
         end
     end
 end
