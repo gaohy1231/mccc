@@ -792,7 +792,7 @@ local function hudMonitorUI()
                         dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
                     end
                 end
-            end
+                end      
                 if isFirstFrame or sText~=info.lastSText or rText~=info.lastRText
                     or lText~=info.lastLText or dText~=info.lastDText
                     or iffMode~=info.lastIffMode
