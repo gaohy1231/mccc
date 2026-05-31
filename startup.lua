@@ -762,15 +762,11 @@ local function hudMonitorUI()
                     sText="ACTIVE"; sColor=colors.green
                     rText=string.format("%dm",math_floor(currentRadarRange))
                     rColor=colors.lime
-                if selectedTargetId and targets[selectedTargetId] then
-                    local sel=targets[selectedTargetId]
-                    -- 计算方位角
-                    local absBearing = (sel.paintedYaw + 360) % 360
-                    local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
-                    local bearingStr = string.format(" %03d°/%03d°", relBearing, absBearing)
-                    -- 速度字符串（不变）
-                    local speedStr = ""
-                    if sel.speed then
+               if selectedTargetId and targets[selectedTargetId] then
+                        local sel=targets[selectedTargetId]
+                        -- 准备速度字符串
+                        local speedStr = ""
+                        if sel.speed then
                         local radial = ""
                         if sel.radialSpeed then
                             if sel.radialSpeed > 0.5 then radial = " [A]"
@@ -778,21 +774,30 @@ local function hudMonitorUI()
                             else radial = " [=]" end
                         end
                         speedStr = string.format(" %.0fm/s%s", sel.speed, radial)
-                    else
+                        else
                         speedStr = " ?m/s"
-                    end
-                    if sel.iff=="friendly" then
-                        lText="ALLY"; lColor=colors.green
-                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.green
-                    elseif sel.iff=="enemy" then
-                        lText="ENEMY"; lColor=colors.red
-                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
+                        end
+
+                        -- 计算方位角（使用 paintYaw，并转换为相对船艏和绝对方位）
+                        local absBearing = (sel.paintedYaw + 360) % 360
+                        local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
+                        local bearingStr = string.format(" %03d°/%03d°", relBearing, absBearing)
+
+                        if sel.iff=="friendly" then
+                            lText="ALLY"; lColor=colors.green
+                            dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.green
+                        elseif sel.iff=="enemy" then
+                            lText="ENEMY"; lColor=colors.red
+                            dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
+                        else
+                            lText="LOCKED"; lColor=colors.yellow
+                            dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
+                        end
                     else
-                        lText="LOCKED"; lColor=colors.yellow
-                        dText=(selectedTargetDistStr or "---") .. speedStr .. bearingStr; dColor=colors.white
+                        lText="SCAN"; lColor=colors.lightGray
+                        dText="---";  dColor=colors.gray
                     end
                 end
-                end      
                 if isFirstFrame or sText~=info.lastSText or rText~=info.lastRText
                     or lText~=info.lastLText or dText~=info.lastDText
                     or iffMode~=info.lastIffMode
