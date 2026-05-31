@@ -6,7 +6,7 @@ local STRESS_TO_DISTANCE_RATIO = 4.0
 local CHANNEL                  = 8888
 local SCAN_SECTOR_WIDTH        = 20
 
-local TARGET_FADE_DURATION = 3.0
+local TARGET_FADE_DURATION = 9999
 local TARGET_HOT_DURATION  = 1.0
 local RWR_ARC_DURATION     = 1.0
 
