@@ -594,29 +594,30 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
 if isActive and localPos then
     for i=1,poolCount do
         local t=pool[i]
-        if t and t.s then
-            local targetData = t.id and targets[t.id]
-            if targetData then
-                -- 安全线长：至少 20 像素，避免因半径太小导致线段消失
-                local lineLen = math.max(20, r - 12)
-                local ex = cx + math_floor(lineLen * t.s + 0.5)
-                local ey = cy - math_floor(lineLen * t.cs + 0.5)
-                -- 使用亮黄色粗线（3像素宽）
-                for dy = -1, 1 do
-                    g.line(cx, cy+dy, ex, ey+dy, 0xFFFF00)
-                end
-                -- 文字绘制（如果文字也不显示，可以暂时注释）
-                local speedStr = speedRangeStr(targetData.speed)
-                local radialSym = radialSymbol(targetData.radialSpeed)
-                local absBearing = (targetData.paintedYaw + 360) % 360
-                local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
-                local text = string.format("%s%s %03d° %03d°", speedStr, radialSym, relBearing, absBearing)
-                local tx = ex + 12 * t.s
-                local ty = ey - 12 * t.cs
-                tx = math_max(1, math_min(entry.w - 1, tx))
-                ty = math_max(1, math_min(entry.h - 1, ty))
-                pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
+        if t and t.s and t.paintedYaw then   -- 检查 t 中是否有绘图数据
+            -- 方向线终点（使用固定安全长度，避免半径问题）
+            local lineLen = math.max(20, r - 12)
+            local ex = cx + math_floor(lineLen * t.s + 0.5)
+            local ey = cy - math_floor(lineLen * t.cs + 0.5)
+            -- 绘制加粗黄色方向线（3像素宽）
+            for dy = -1, 1 do
+                g.line(cx, cy+dy, ex, ey+dy, 0xFFFF00)
             end
+
+            -- 速度区间和径向符号
+            local speedStr = speedRangeStr(t.speed)
+            local radialSym = radialSymbol(t.radialSpeed)
+            -- 方位角
+            local absBearing = (t.paintedYaw + 360) % 360
+            local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
+            local text = string.format("%s%s %03d° %03d°", speedStr, radialSym, relBearing, absBearing)
+
+            -- 文本位置沿射线方向偏移12像素
+            local tx = ex + 12 * t.s
+            local ty = ey - 12 * t.cs
+            tx = math_max(1, math_min(entry.w - 1, tx))
+            ty = math_max(1, math_min(entry.h - 1, ty))
+            pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
         end
     end
 end
@@ -680,6 +681,10 @@ local function rdrGpuUI()
                                 t.s=math_sin(yawRad); t.cs=math_cos(yawRad)
                                 t.isBeacon=false
                                 t.id=id
+                                t.paintedYaw = data.paintedYaw
+                                t.paintedDist = data.paintedDist
+                                t.speed = data.speed
+                                t.radialSpeed = data.radialSpeed
                             end
                         end
                     end
@@ -719,6 +724,10 @@ local function rdrGpuUI()
                         t.s=math_sin(yawRad); t.cs=math_cos(yawRad)
                         t.isBeacon=true
                         t.id=id
+                        t.paintedYaw = data.paintedYaw
+                        t.paintedDist = data.paintedDist
+                        t.speed = data.speed
+                        t.radialSpeed = data.radialSpeed
                     end
                 end
             end
