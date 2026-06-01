@@ -1,8 +1,7 @@
---[[ GHG 被动定向水听器 v1.9
-     固定探测距离 5000 米，Camera 自动重连
-     速度平滑：5秒窗口，最小2秒时间差
-     速度过滤：扇区内停留 0.5s 且速度 > 4 km/h 显示
-     锁定后：每 3 秒稳定测速，未完成时显示 ?km/h
+--[[ GHG 被动定向水听器 v2.1
+     动态深度范围（水面1000m，深潜5000m）
+     静默心跳维持授权，targetPool 渲染
+     速度平滑，速度过滤，锁定测速
 --]]
 
 -- ==========================================
@@ -13,28 +12,34 @@ local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
 local LISTEN_SECTOR_WIDTH      = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_CALC_INTERVAL      = 3.0      -- 锁定目标测速间隔（秒）
-local QUICK_SPEED_INTERVAL     = 2.0      -- 普通目标快速检测间隔（秒）
-local LISTEN_HOLD_TIME         = 0.5      -- 停留 0.5 秒即检测
-local MIN_SPEED_KMH            = 4.0      -- 最小显示速度 (km/h)
-local FIXED_RANGE              = 5000     -- 固定探测距离（米）
+local SPEED_CALC_INTERVAL      = 3.0
+local QUICK_SPEED_INTERVAL     = 2.0
+local LISTEN_HOLD_TIME         = 0.5
+local MIN_SPEED_KMH            = 4.0
+local HEARTBEAT_INTERVAL       = 5.0
+
+-- 深度映射（根据服务器实际海平面修改 SEA_LEVEL_Y）
+local SEA_LEVEL_Y    = -4        -- 海平面 Y 坐标（通常为 63，这里 -4 为示例）
+local RANGE_SURFACE  = 1000
+local RANGE_DEEP     = 5000
+local DEEP_Y         = -14
 
 -- ==========================================
 -- 外设初始化
 -- ==========================================
 local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
-if not modem then error("Error: Wireless or Ender Modem not found!", 0) end
+if not modem then error("Wireless modem required!", 0) end
 modem.open(CHANNEL)
 
 local camera, cameraName = nil, nil
 for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "camera" then
-        camera     = peripheral.wrap(name)
+        camera = peripheral.wrap(name)
         cameraName = name
         break
     end
 end
-if not camera then error("Error: Camera not found!", 0) end
+if not camera then error("Camera required!", 0) end
 
 local cachedServo = peripheral.find("servo")
 local isServoConnected = false
@@ -45,20 +50,20 @@ local myId        = os.getComputerID()
 local CONFIG_FILE = "ghg_config.txt"
 
 -- ==========================================
--- 全局 API 别名
+-- 数学别名
 -- ==========================================
-local math_sqrt     = math.sqrt
-local math_atan2    = math.atan2
-local math_deg      = math.deg
-local math_rad      = math.rad
-local math_floor    = math.floor
-local math_abs      = math.abs
-local math_min      = math.min
-local math_max      = math.max
-local math_sin      = math.sin
-local math_cos      = math.cos
-local os_clock      = os.clock
-local os_pullEvent  = os.pullEvent
+local math_sqrt  = math.sqrt
+local math_atan2 = math.atan2
+local math_deg   = math.deg
+local math_rad   = math.rad
+local math_floor = math.floor
+local math_abs   = math.abs
+local math_min   = math.min
+local math_max   = math.max
+local math_sin   = math.sin
+local math_cos   = math.cos
+local os_clock   = os.clock
+local os_pullEvent = os.pullEvent
 
 -- ==========================================
 -- 颜色工具
@@ -69,13 +74,13 @@ local function colorUnpack(c)
            c % 0x100
 end
 local function colorPack(r, g, b)
-    return math_floor(r) * 0x10000 + math_floor(g) * 0x100 + math_floor(b)
+    return math_floor(r)*0x10000 + math_floor(g)*0x100 + math_floor(b)
 end
 local function colorLerp(ca, cb, t)
     t = math_max(0.0, math_min(1.0, t))
     local ar, ag, ab = colorUnpack(ca)
     local br, bg, bb = colorUnpack(cb)
-    return colorPack(ar + (br-ar)*t, ag + (bg-ag)*t, ab + (bb-ab)*t)
+    return colorPack(ar+(br-ar)*t, ag+(bg-ag)*t, ab+(bb-ab)*t)
 end
 local function calcFadeColor(age, hotColor)
     if age >= TARGET_FADE_DURATION then return nil end
@@ -102,7 +107,9 @@ local isEditing             = false
 local inputStr              = ""
 local iffMode               = "enemy"
 local currentNorthYawDeg    = 0
-local currentPassiveRange   = FIXED_RANGE   -- 固定 5000
+local currentPassiveRange   = RANGE_SURFACE
+local targetPool            = {}
+local targetPoolCount       = 0
 
 -- ==========================================
 --  配置文件
@@ -113,28 +120,21 @@ local function loadConfig()
         local data = textutils.unserialize(f.readAll())
         f.close()
         if type(data) == "table" then
-            if data.yawOffset   then yawOffset    = tonumber(data.yawOffset)   or 0 end
-            if data.motorOffset then motorOffset  = tonumber(data.motorOffset) or 0 end
-            if type(data.monitorModes) == "table" then
-                monitorModes = data.monitorModes
-            end
+            if data.yawOffset   then yawOffset   = tonumber(data.yawOffset) or 0 end
+            if data.motorOffset then motorOffset = tonumber(data.motorOffset) or 0 end
+            if type(data.monitorModes) == "table" then monitorModes = data.monitorModes end
         end
     end
 end
-
 local function saveConfig()
     local f = fs.open(CONFIG_FILE, "w")
-    f.write(textutils.serialize({
-        yawOffset    = yawOffset,
-        motorOffset  = motorOffset,
-        monitorModes = monitorModes,
-    }))
+    f.write(textutils.serialize({ yawOffset = yawOffset, motorOffset = motorOffset, monitorModes = monitorModes }))
     f.close()
 end
 loadConfig()
 
 -- ==========================================
--- 数学/物理函数
+-- 物理/几何函数
 -- ==========================================
 local function calculateLookAngles(sx, sy, sz, tx, ty, tz)
     local dx, dy, dz = tx - sx, ty - sy, tz - sz
@@ -143,8 +143,7 @@ local function calculateLookAngles(sx, sy, sz, tx, ty, tz)
 end
 local function getAngleDiff(a, b)
     local diff = (a - b) % 360
-    if diff >  180 then diff = diff - 360 end
-    if diff < -180 then diff = diff + 360 end
+    if diff > 180 then diff = diff - 360 elseif diff < -180 then diff = diff + 360 end
     return diff
 end
 local function quatInverse(qx, qy, qz, qw) return -qx, -qy, -qz, qw end
@@ -155,16 +154,12 @@ local function rotateVectorFast(vx, vy, vz, qx, qy, qz, qw)
 end
 local function calcRangingDist(refPos, targetPos)
     if not refPos or not targetPos then return nil end
-    local dx = targetPos.x - refPos.x
-    local dy = targetPos.y - refPos.y
-    local dz = targetPos.z - refPos.z
+    local dx = targetPos.x - refPos.x; local dy = targetPos.y - refPos.y; local dz = targetPos.z - refPos.z
     return math_sqrt(dx*dx + dy*dy + dz*dz)
 end
 local function radialSymbol(radial_speed)
     if not radial_speed then return "?" end
-    if radial_speed > 0.5 then return "A"
-    elseif radial_speed < -0.5 then return "C"
-    else return "=" end
+    if radial_speed > 0.5 then return "A" elseif radial_speed < -0.5 then return "C" else return "=" end
 end
 local function pointToSegmentSq(px, py, p1x, p1y, p2x, p2y)
     local dx, dy = p2x-p1x, p2y-p1y
@@ -176,26 +171,14 @@ local function pointToSegmentSq(px, py, p1x, p1y, p2x, p2y)
 end
 
 -- ==========================================
--- 颜色常量（黑底黄绿主题）
+-- 颜色常量
 -- ==========================================
 local C = {
-    BG          = 0x000000,
-    OUTER_RING  = 0xFFCC00,
-    INNER_RING  = 0x997700,
-    GRID        = 0x332200,
-    LISTEN_LINE = 0xFFFFFF,   -- 白色监听箭头
-    TARGET_LINE = 0x0066FF,
-    LOCKED_LINE = 0xFF0000,
-    YELLOW      = 0xFFFF00,
-    ALLY_HOT    = 0x44FFAA,
-    FOE_HOT     = 0xFF3300,
-    UNK_HOT     = 0x66FF66,
-    CORNER_FOE  = 0x440000,
-    CORNER_ALLY = 0x002200,
-    BLACK       = 0x000000,
-    WHITE       = 0xFFFFFF,
-    UNREG_FG    = 0xFF2200,
-    UNREG_BG    = 0x1A0000,
+    BG=0x000000, OUTER_RING=0xFFCC00, INNER_RING=0x997700, GRID=0x332200,
+    LISTEN_LINE=0xFFFFFF, TARGET_LINE=0x0066FF, LOCKED_LINE=0xFF0000,
+    YELLOW=0xFFFF00, ALLY_HOT=0x44FFAA, FOE_HOT=0xFF3300, UNK_HOT=0x66FF66,
+    CORNER_FOE=0x440000, CORNER_ALLY=0x002200, BLACK=0x000000, WHITE=0xFFFFFF,
+    UNREG_FG=0xFF2200, UNREG_BG=0x1A0000,
 }
 
 -- ==========================================
@@ -208,8 +191,8 @@ for _, name in ipairs(peripheral.getNames()) do
         local m = peripheral.wrap(name)
         m.setTextScale(1)
         local cw, ch = m.getSize()
-        local bw = math.ceil(cw / 9)
-        local bh = math.ceil(ch / 7)
+        local bw = math.ceil(cw/9)
+        local bh = math.ceil(ch/7)
         if bw >= 5 then bw = bw - 1 end
         table.insert(hudMonitorList, {
             m = m, name = name, displayName = "Monitor "..mIndex,
@@ -222,7 +205,7 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 
 -- ==========================================
--- 声纳 GPU 列表
+-- GPU 列表
 -- ==========================================
 local BLOCK_PX_W, BLOCK_PX_H = 85, 64
 local sonarGpuList = {}
@@ -232,14 +215,12 @@ local function initGpuList()
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "tm_gpu" then
             local g = peripheral.wrap(name)
-            pcall(g.refreshSize)
-            pcall(g.setSize, 64)
-            pcall(g.fill, C.BG)
+            pcall(g.refreshSize); pcall(g.setSize, 64); pcall(g.fill, C.BG)
             local ok, w, h = pcall(g.getSize)
             if not ok then w, h = 256, 128 end
             w, h = w or 256, h or 128
             local cx, cy = math_floor(w/2), math_floor(h/2)
-            local r = math_floor(math_min(cx, cy) * 0.88)
+            local r = math_floor(math_min(cx, cy)*0.88)
             local bw = math_max(1, math_floor(w/BLOCK_PX_W))
             local bh = math_max(1, math_floor(h/BLOCK_PX_H))
             local dotSize
@@ -258,17 +239,15 @@ initGpuList()
 local isHeadless = (#hudMonitorList==0 and #sonarGpuList==0)
 
 -- ==========================================
--- 注册检查（忽略授权距离，只取名称）
+-- 注册（忽略距离授权，仅取名称）
 -- ==========================================
 local function checkRegistration()
-    term.setBackgroundColor(colors.black)
-    term.clear()
-    term.setCursorPos(1,1)
-    term.setTextColor(colors.cyan)
-    print("GHG Sonar v1.9 - Registration Check")
+    term.setBackgroundColor(colors.black); term.clear()
+    term.setCursorPos(1,1); term.setTextColor(colors.cyan)
+    print("GHG Sonar v2.1 - Registration")
     term.setTextColor(colors.white)
-    print(string.format("My ID: %d", myId))
-    print("Querying scanner...")
+    print("My ID: " .. myId)
+    print("Requesting authorization...")
 
     for _, entry in ipairs(sonarGpuList) do
         pcall(function()
@@ -290,24 +269,16 @@ local function checkRegistration()
                 if d.t==5 and d.ti==myId then
                     os.cancelTimer(timer)
                     myLabel = tostring(d.n or myLabel)
-                    -- 完全忽略授权距离，使用固定 5000
                     term.setTextColor(colors.lime)
-                    print(string.format("Registered! Name: %s", myLabel))
+                    print("Registered: " .. myLabel)
                     sleep(0.8)
                     return true
                 elseif d.t==6 and d.ti==myId then
-                    os.cancelTimer(timer)
-                    term.setTextColor(colors.red)
-                    print("Not registered!")
-                    sleep(0.5)
-                    return false
+                    os.cancelTimer(timer); term.setTextColor(colors.red); print("Denied!"); sleep(0.5); return false
                 end
             end
         elseif ev=="timer" and a==timer then
-            term.setTextColor(colors.orange)
-            print("Timeout - scanner not responding.")
-            sleep(0.5)
-            return false
+            term.setTextColor(colors.orange); print("No response"); sleep(0.5); return false
         end
     end
 end
@@ -315,86 +286,37 @@ end
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(sonarGpuList) do
         pcall(function()
-            local g = entry.gpu
-            local cx, cy = entry.cx, entry.cy
-            local w, h = entry.w, entry.h
+            local g = entry.gpu; local cx,cy = entry.cx, entry.cy; local w,h = entry.w, entry.h
             g.fill(C.UNREG_BG)
-            local bx1, by1 = math_floor(cx * 0.3), math_floor(cy * 0.5)
-            local bx2, by2 = w - bx1, h - by1
-            g.line(bx1, by1, bx2, by1, C.UNREG_FG)
-            g.line(bx1, by2, bx2, by2, C.UNREG_FG)
-            g.line(bx1, by1, bx1, by2, C.UNREG_FG)
-            g.line(bx2, by1, bx2, by2, C.UNREG_FG)
-            local line1 = "NOT REGISTERED"
-            local tx1 = math_max(bx1+4, cx - math_floor(#line1*6))
-            pcall(g.drawText, tx1, cy-14, line1, C.UNREG_FG, C.UNREG_BG, 2)
-            local line2 = string.format("ID: %d", myId)
-            local tx2 = math_max(bx1+4, cx - math_floor(#line2*3))
-            pcall(g.drawText, tx2, cy+6, line2, 0xAAAAAA, C.UNREG_BG, 1)
-            local line3 = "Register in scanner"
-            local tx3 = math_max(bx1+4, cx - math_floor(#line3*3))
-            pcall(g.drawText, tx3, cy+18, line3, 0x666666, C.UNREG_BG, 1)
+            g.line(math_floor(cx*0.3), math_floor(cy*0.5), w-math_floor(cx*0.3), math_floor(cy*0.5), C.UNREG_FG)
+            g.line(math_floor(cx*0.3), h-math_floor(cy*0.5), w-math_floor(cx*0.3), h-math_floor(cy*0.5), C.UNREG_FG)
+            g.line(math_floor(cx*0.3), math_floor(cy*0.5), math_floor(cx*0.3), h-math_floor(cy*0.5), C.UNREG_FG)
+            g.line(w-math_floor(cx*0.3), math_floor(cy*0.5), w-math_floor(cx*0.3), h-math_floor(cy*0.5), C.UNREG_FG)
+            pcall(g.drawText, math_floor(cx*0.3)+4, cy-14, "NOT REGISTERED", C.UNREG_FG, C.UNREG_BG, 2)
+            pcall(g.drawText, math_floor(cx*0.3)+4, cy+6, "ID: "..myId, 0xAAAAAA, C.UNREG_BG, 1)
+            pcall(g.drawText, math_floor(cx*0.3)+4, cy+18, "Register in scanner", 0x666666, C.UNREG_BG, 1)
             g.sync()
         end)
     end
     for _, info in ipairs(hudMonitorList) do
         pcall(function()
-            local m = info.m
-            m.setBackgroundColor(colors.black)
-            m.clear()
-            local dw, dh = m.getSize()
-            local msg1 = "NOT REGISTERED"
-            local msg2 = "ID: " .. myId
-            local msg3 = "Use scanner to register"
-            m.setTextColor(colors.red)
-            m.setCursorPos(math_max(1, math_floor((dw-#msg1)/2)+1), math_max(1, math_floor(dh/2)-1))
-            m.write(msg1)
-            m.setTextColor(colors.gray)
-            m.setCursorPos(math_max(1, math_floor((dw-#msg2)/2)+1), math_floor(dh/2)+1)
-            m.write(msg2)
-            m.setTextColor(colors.lightGray)
-            m.setCursorPos(math_max(1, math_floor((dw-#msg3)/2)+1), math_floor(dh/2)+2)
-            m.write(msg3)
+            local m = info.m; m.setBackgroundColor(colors.black); m.clear(); local dw,dh = m.getSize()
+            m.setTextColor(colors.red); m.setCursorPos(math_max(1, (dw-16)/2+1), math_floor(dh/2)-1); m.write("NOT REGISTERED")
+            m.setTextColor(colors.gray); m.setCursorPos(math_max(1, (dw-(#("ID: "..myId)))/2+1), math_floor(dh/2)+1); m.write("ID: "..myId)
+            m.setTextColor(colors.lightGray); m.setCursorPos(math_max(1, (dw-20)/2+1), math_floor(dh/2)+2); m.write("Use scanner to register")
         end)
     end
-    term.setBackgroundColor(colors.black)
-    term.clear()
-    local tw, th = term.getSize()
-    local lines = {
-        { "",                         colors.red    },
-        { "    NOT REGISTERED    ",   colors.red    },
-        { "",                         colors.red    },
-        { "",                         colors.white  },
-        { "ID: " .. myId,             colors.white  },
-        { "Register this sonar in",   colors.gray   },
-        { "ghg_scanner.lua first.",   colors.gray   },
-        { "",                         colors.white  },
-        { "Program halted.",          colors.orange },
-    }
-    local startRow = math_max(1, math_floor((th - #lines)/2))
-    for i, line in ipairs(lines) do
-        term.setCursorPos(math_max(1, math_floor((tw - #line[1])/2)+1), startRow+i-1)
-        term.setTextColor(line[2])
-        term.write(line[1])
-    end
+    term.setBackgroundColor(colors.black); term.clear()
+    term.setTextColor(colors.red); term.setCursorPos(1,2); term.write("NOT REGISTERED")
     while true do sleep(60) end
 end
 
-local isRegistered = checkRegistration()
-if not isRegistered then
-    showNotRegisteredAndHalt()
-    return
-end
+if not checkRegistration() then showNotRegisteredAndHalt() return end
 
-term.setBackgroundColor(colors.black)
-term.clear()
-term.setCursorPos(1,1)
-term.setTextColor(colors.green)
-print("Registration OK. Starting GHG sonar...")
-sleep(0.5)
+term.setTextColor(colors.green); print("Starting passive sonar..."); sleep(0.5)
 
 -- ==========================================
--- GPU 绘制函数
+-- GPU 绘制基础
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1-r
@@ -403,8 +325,7 @@ local function gpuDrawCircle(g, cx, cy, r, color)
         g.line(cx+x,cy-y,cx+x,cy-y,color); g.line(cx-x,cy-y,cx-x,cy-y,color)
         g.line(cx+y,cy+x,cx+y,cy+x,color); g.line(cx-y,cy+x,cx-y,cy+x,color)
         g.line(cx+y,cy-x,cx+y,cy-x,color); g.line(cx-y,cy-x,cx-y,cy-x,color)
-        y = y+1
-        if d<0 then d = d+2*y+1 else x = x-1; d = d+2*(y-x)+1 end
+        y = y+1; if d<0 then d = d+2*y+1 else x = x-1; d = d+2*(y-x)+1 end
     end
 end
 local function gpuDrawIffCorners(entry)
@@ -417,20 +338,18 @@ local function gpuDrawIffCorners(entry)
             g.line(ox+hx*t, oy+hy*t, ox+hx*t+vx*(L_LEN-1), oy+hy*t+vy*(L_LEN-1), col)
         end
     end
-    corner(1,1,1,0,0,1); corner(W,1,-1,0,0,1)
-    corner(1,H,1,0,0,-1); corner(W,H,-1,0,0,-1)
+    corner(1,1,1,0,0,1); corner(W,1,-1,0,0,1); corner(1,H,1,0,0,-1); corner(W,H,-1,0,0,-1)
 end
 local function gpuDrawSonarBase(entry)
     local g, cx, cy, r = entry.gpu, entry.cx, entry.cy, entry.r
     g.fill(C.BG)
-    gpuDrawCircle(g,cx,cy,r,C.OUTER_RING)
-    gpuDrawCircle(g,cx,cy,math_floor(r/2),C.INNER_RING)
+    gpuDrawCircle(g,cx,cy,r,C.OUTER_RING); gpuDrawCircle(g,cx,cy,math_floor(r/2),C.INNER_RING)
     g.line(cx,cy-r,cx,cy+r,C.GRID); g.line(cx-r,cy,cx+r,cy,C.GRID)
     for t=-r,r do
         if t%4<2 then
             local py = cy+t
-            if (cx+t-cx)^2 + (py-cy)^2 <= r*r then g.line(cx+t,py,cx+t,py,C.GRID) end
-            if (cx-t-cx)^2 + (py-cy)^2 <= r*r then g.line(cx-t,py,cx-t,py,C.GRID) end
+            if (cx+t-cx)^2+(py-cy)^2 <= r*r then g.line(cx+t,py,cx+t,py,C.GRID) end
+            if (cx-t-cx)^2+(py-cy)^2 <= r*r then g.line(cx-t,py,cx-t,py,C.GRID) end
         end
     end
     local labels = {[0]="N", [90]="E", [180]="S", [270]="W"}
@@ -446,8 +365,7 @@ local function gpuDrawSonarBase(entry)
         if label then
             local tx = cx + math_floor((r-12)*sinA+0.5) - 4
             local ty = cy - math_floor((r-12)*cosA+0.5) - 4
-            tx = math_max(1, math_min(entry.w-8, tx))
-            ty = math_max(1, math_min(entry.h-8, ty))
+            tx = math_max(1, math_min(entry.w-8, tx)); ty = math_max(1, math_min(entry.h-8, ty))
             pcall(g.drawText, tx, ty, label, C.WHITE, C.BG, 1)
         end
     end
@@ -455,20 +373,17 @@ end
 local function gpuDrawListeningLine(entry, angleDeg)
     local g, cx, cy, r = entry.gpu, entry.cx, entry.cy, entry.r
     local rad = math_rad(angleDeg + yawOffset)
-    local ex = cx + math_floor(r*math_sin(rad)+0.5)
-    local ey = cy - math_floor(r*math_cos(rad)+0.5)
+    local ex = cx + math_floor(r*math_sin(rad)+0.5); local ey = cy - math_floor(r*math_cos(rad)+0.5)
     g.line(cx,cy,ex,ey,C.LISTEN_LINE)
     local arrLen = 4
-    local rad1 = math_rad(angleDeg+yawOffset+150)
-    local rad2 = math_rad(angleDeg+yawOffset-150)
+    local rad1 = math_rad(angleDeg+yawOffset+150); local rad2 = math_rad(angleDeg+yawOffset-150)
     g.line(ex,ey, ex+math_floor(arrLen*math_sin(rad1)+0.5), ey-math_floor(arrLen*math_cos(rad1)+0.5), C.LISTEN_LINE)
     g.line(ex,ey, ex+math_floor(arrLen*math_sin(rad2)+0.5), ey-math_floor(arrLen*math_cos(rad2)+0.5), C.LISTEN_LINE)
 end
 local function gpuDrawTargetLine(entry, yawRad, color, targetData)
     local g, cx, cy, r = entry.gpu, entry.cx, entry.cy, entry.r
-    local ex = cx + math_floor(r * math_sin(yawRad) + 0.5)
-    local ey = cy - math_floor(r * math_cos(yawRad) + 0.5)
-    g.line(cx, cy, ex, ey, color)
+    local ex = cx + math_floor(r*math_sin(yawRad)+0.5); local ey = cy - math_floor(r*math_cos(yawRad)+0.5)
+    g.line(cx,cy,ex,ey,color)
     if targetData then
         local relBearing = (targetData.paintedYaw + 360) % 360
         local absBearing = (relBearing + currentNorthYawDeg + yawOffset + 360) % 360
@@ -478,42 +393,57 @@ local function gpuDrawTargetLine(entry, yawRad, color, targetData)
         end
         local radial = radialSymbol(targetData.radialSpeed)
         local text = string.format("%03d/%03d %s%s", relBearing, absBearing, speedStr, radial)
-        local tx = math_max(1, math_min(entry.w - 1, ex + 8 * math_sin(yawRad)))
-        local ty = math_max(1, math_min(entry.h - 1, ey - 8 * math_cos(yawRad)))
+        local tx = math_max(1, math_min(entry.w-1, ex + 8*math_sin(yawRad)))
+        local ty = math_max(1, math_min(entry.h-1, ey - 8*math_cos(yawRad)))
         pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 0)
     end
 end
-local function gpuRefreshSonar(entry)
+local function gpuRefreshSonar(entry, pool, poolCount)
     gpuDrawSonarBase(entry)
-    if isServoConnected then
-        gpuDrawListeningLine(entry, currentServoAngle)
-    end
-    local now = os_clock()
-    for id, data in pairs(targets) do
-        local isLocked = (id == selectedTargetId)
-        if isLocked and data.paintedYaw then
-            gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.LOCKED_LINE, data)
-        elseif data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
-            local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
-            if col then
-                gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.TARGET_LINE, data)
-            end
-        end
+    if isServoConnected then gpuDrawListeningLine(entry, currentServoAngle) end
+    for i=1, poolCount do
+        local t = pool[i]
+        gpuDrawTargetLine(entry, t.rad, t.color, t.data)
     end
     gpuDrawIffCorners(entry)
     entry.gpu.sync()
 end
 
 -- ==========================================
--- GPU 主循环
+-- GPU 主循环（含 targetPool 构建）
 -- ==========================================
 local function sonarGpuUI()
     if #sonarGpuList == 0 then return end
     while true do
         if currentScreenTab == 2 then sleep(0.3)
         else
-            for _,e in ipairs(sonarGpuList) do
-                pcall(gpuRefreshSonar, e)
+            targetPoolCount = 0
+            local now = os_clock()
+            for id, data in pairs(targets) do
+                local isLocked = (id == selectedTargetId)
+                if isLocked then
+                    if data.paintedYaw then
+                        targetPoolCount = targetPoolCount + 1
+                        local t = targetPool[targetPoolCount]
+                        if not t then t = {}; targetPool[targetPoolCount] = t end
+                        t.rad = math_rad(data.paintedYaw + yawOffset)
+                        t.color = C.LOCKED_LINE
+                        t.data = data
+                    end
+                elseif data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
+                    local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
+                    if col then
+                        targetPoolCount = targetPoolCount + 1
+                        local t = targetPool[targetPoolCount]
+                        if not t then t = {}; targetPool[targetPoolCount] = t end
+                        t.rad = math_rad(data.paintedYaw + yawOffset)
+                        t.color = C.TARGET_LINE
+                        t.data = data
+                    end
+                end
+            end
+            for _, entry in ipairs(sonarGpuList) do
+                pcall(gpuRefreshSonar, entry, targetPool, targetPoolCount)
             end
             sleep(0.05)
         end
@@ -528,11 +458,11 @@ local function hudMonitorUI()
     local frames = 0
     while true do
         frames = frames+1
-        for _,info in ipairs(hudMonitorList) do
-            if info.mode=="STATUS" then
+        for _, info in ipairs(hudMonitorList) do
+            if info.mode == "STATUS" then
                 local sText, sColor = "PASSIVE", colors.green
                 local rText, rColor = string.format("%dm", math_floor(currentPassiveRange)), colors.lime
-                local lText, lColor, dText, dColor
+                local lText, lColor, dText
                 if selectedTargetId and targets[selectedTargetId] then
                     local sel = targets[selectedTargetId]
                     local relB = (sel.paintedYaw + 360) % 360
@@ -542,16 +472,13 @@ local function hudMonitorUI()
                     if sel.speed and sel.speedLastCalc and (os_clock() - sel.speedLastCalc < SPEED_CALC_INTERVAL + 2.0) then
                         spdStr = string.format("%.1fkm/h", sel.speed * 3.6)
                     end
-                    local idStr = tostring(sel.name or "??")
-                    lText = idStr .. " " .. distStr
+                    lText = (sel.name or "??") .. " " .. distStr
                     lColor = colors.red
                     dText = string.format("%03d/%03d %s%s", relB, absB, spdStr, radialSymbol(sel.radialSpeed))
                 else
-                    lText = "LISTEN"; lColor = colors.lightGray
-                    dText = "---"
+                    lText = "LISTEN"; lColor = colors.lightGray; dText = "---"
                 end
-                if frames<=2 or sText~=info.lastSText or rText~=info.lastRText
-                    or lText~=info.lastLText or dText~=info.lastDText then
+                if frames<=2 or sText~=info.lastSText or rText~=info.lastRText or lText~=info.lastLText or dText~=info.lastDText then
                     info.m.setBackgroundColor(colors.black); info.m.clear()
                     local dw,dh = info.m.getSize()
                     local function drawCL(txt,col,y) info.m.setTextColor(col); info.m.setCursorPos(math_max(1,(dw-#txt)/2+1),y); info.m.write(txt) end
@@ -559,7 +486,7 @@ local function hudMonitorUI()
                     drawCL(rText,rColor, math_floor(dh/2)-1)
                     drawCL(lText,lColor, math_floor(dh/2)+1)
                     drawCL(dText,colors.white, math_floor(dh/2)+3)
-                    info.lastSText,info.lastRText,info.lastLText,info.lastDText = sText,rText,lText,dText
+                    info.lastSText, info.lastRText, info.lastLText, info.lastDText = sText, rText, lText, dText
                 end
             end
         end
@@ -572,53 +499,18 @@ end
 -- ==========================================
 local function termUI()
     while true do
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        if currentScreenTab==2 then
-            term.setCursorPos(2,2); term.setTextColor(colors.lightGray)
-            term.write("=== CONNECTED DISPLAYS ===")
+        term.setBackgroundColor(colors.black); term.clear()
+        if currentScreenTab == 2 then
+            term.setCursorPos(2,2); term.setTextColor(colors.lightGray); term.write("=== CONNECTED DISPLAYS ===")
             local r = 4
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[TOM'S GPU - SONAR]"); r = r+1
-            if #sonarGpuList == 0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No tm_gpu found."); r = r+1
-            else
-                for _,entry in ipairs(sonarGpuList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..entry.name)
-                    term.setCursorPos(22,r); term.setTextColor(colors.white)
-                    term.write(string.format("[%dx%d]",entry.bw,entry.bh))
-                    term.setCursorPos(30,r); term.setTextColor(colors.green)
-                    term.write("[dot:"..entry.dotSize.."]"); r = r+1
-                end
-            end
-            r = r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[CC MONITOR - HUD]"); r = r+1
-            if #hudMonitorList == 0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No monitors found."); r = r+1
-            else
-                for _,info in ipairs(hudMonitorList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..info.displayName)
-                    term.setCursorPos(24,r); term.setTextColor(colors.yellow)
-                    term.write("[HUD]"); info.termRow = r; r = r+1
-                end
-            end
-            r = r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.lightGray)
-            term.write("Camera: ")
-            local shortN = cameraName
-            if #shortN>12 then shortN = shortN:sub(1,12) end
-            term.setTextColor(colors.white); term.write(shortN)
-            term.setTextColor(colors.cyan);  term.write("  [ONLINE]")
-            r = r+2
-            term.setCursorPos(2,r); term.setTextColor(colors.yellow)
-            term.write("Press [TAB] to Resume"); r = r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.red)
-            term.write("[SYSTEM PAUSED FOR CONFIG]")
+            term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[TOM'S GPU - SONAR]"); r = r+1
+            if #sonarGpuList == 0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No tm_gpu"); r = r+1
+            else for _,e in ipairs(sonarGpuList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..e.name); r = r+1 end end
+            r = r+1; term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[CC MONITOR - HUD]"); r = r+1
+            if #hudMonitorList == 0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No monitors"); r = r+1
+            else for _,info in ipairs(hudMonitorList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..info.displayName); r = r+1 end end
+            r = r+1; term.setCursorPos(2,r); term.setTextColor(colors.lightGray); term.write("Camera: "..cameraName.."  [ONLINE]")
+            r = r+2; term.setCursorPos(2,r); term.setTextColor(colors.yellow); term.write("Press [TAB] to Resume")
         else
             term.setCursorPos(2,2); term.setTextColor(colors.yellow); term.write("=== GHG SONAR CONFIG ===")
             local function drawInputBox(y,label,val,sel,edit)
@@ -626,21 +518,16 @@ local function termUI()
                 term.setTextColor(sel and colors.yellow or colors.lightGray); term.write(label)
                 term.setCursorPos(15,y); term.setBackgroundColor(colors.gray)
                 local txt = (sel and edit) and (inputStr.."_") or tostring(val)
-                term.setTextColor(sel and colors.white or colors.lightGray)
-                term.write(string.format(" %-12s ", txt))
+                term.setTextColor(sel and colors.white or colors.lightGray); term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
-            drawInputBox(4, "Hydro Offset:", yawOffset,   menuIndex==1, isEditing)
+            drawInputBox(4, "Hydro Offset:", yawOffset, menuIndex==1, isEditing)
             drawInputBox(6, "Motor Offset:", motorOffset, menuIndex==2, isEditing)
             term.setCursorPos(2,10); term.setTextColor(colors.yellow); term.write("=== SYSTEM STATUS ===")
-            term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write(string.format("Registered: %s", myLabel))
-            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write(string.format("Max Range : %d m (fixed)", FIXED_RANGE))
-            term.setCursorPos(2,16)
-            if isServoConnected then term.setTextColor(colors.white); term.write(string.format("Listen Dir: %6.1f deg", currentServoAngle))
-            else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
-            term.setCursorPos(2,18)
-            if iffMode=="friendly" then term.setTextColor(colors.lightBlue); term.write("IFF Mode: ALLY")
-            else term.setTextColor(colors.red); term.write("IFF Mode: FOE") end
+            term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write("Registered: "..myLabel)
+            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write("Max Range: "..math_floor(currentPassiveRange).." m (dynamic)")
+            term.setCursorPos(2,16); if isServoConnected then term.setTextColor(colors.white); term.write("Listen Dir: "..string.format("%.1f", currentServoAngle).." deg") else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
+            term.setCursorPos(2,18); if iffMode=="friendly" then term.setTextColor(colors.lightBlue); term.write("IFF: ALLY") else term.setTextColor(colors.red); term.write("IFF: FOE") end
             term.setCursorPos(2,19); term.setTextColor(colors.gray); term.write("[TAB] Monitor  [Back RS] IFF")
         end
         sleep(0.2)
@@ -648,7 +535,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件（线段点选锁定/取消）
+-- 输入事件
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -681,18 +568,30 @@ local function inputLoop()
                 local mx, my = p2, p3
                 for id, data in pairs(targets) do
                     if data.paintedYaw then
-                        local yawRad = math_rad(data.paintedYaw + yawOffset)
-                        local ex = entry.cx + math_floor(entry.r*math_sin(yawRad)+0.5)
-                        local ey = entry.cy - math_floor(entry.r*math_cos(yawRad)+0.5)
+                        local rad = math_rad(data.paintedYaw + yawOffset)
+                        local ex = entry.cx + math_floor(entry.r*math_sin(rad)+0.5)
+                        local ey = entry.cy - math_floor(entry.r*math_cos(rad)+0.5)
                         if pointToSegmentSq(mx, my, entry.cx, entry.cy, ex, ey) <= 16 then
-                            if id == selectedTargetId then selectedTargetId = nil
-                            else selectedTargetId = id end
+                            if id == selectedTargetId then selectedTargetId = nil else selectedTargetId = id end
                             break
                         end
                     end
                 end
             end
         end
+    end
+end
+
+-- ==========================================
+-- 静默心跳（只发 t=7，不含坐标）
+-- ==========================================
+local function heartbeatLoop()
+    while true do
+        if currentScreenTab ~= 2 then
+            modem.transmit(CHANNEL, CHANNEL, { v=2, t=7, i=myId })
+            print("Heartbeat sent") -- DEBUG，可注释
+        end
+        sleep(HEARTBEAT_INTERVAL)
     end
 end
 
@@ -709,27 +608,26 @@ local function listenLoop()
             t.modemDist = dist
             t.realDist = calcRangingDist(localPos, t.realPos) or dist
             t.lastSeen = os_clock()
+            print("Heard " .. (msg.n or "?") .. " dist " .. dist) -- DEBUG，可注释
         end
     end
 end
 
 -- ==========================================
--- IFF 切换（后部红石）
+-- IFF 切换
 -- ==========================================
 local function iffToggleLoop()
     local lastBack = redstone.getInput("back")
     while true do
         os_pullEvent("redstone")
         local newBack = redstone.getInput("back")
-        if newBack and not lastBack then
-            iffMode = (iffMode=="enemy") and "friendly" or "enemy"
-        end
+        if newBack and not lastBack then iffMode = (iffMode=="enemy") and "friendly" or "enemy" end
         lastBack = newBack
     end
 end
 
 -- ==========================================
--- 被动监听主循环（Camera 重连、固定范围、速度平滑）
+-- 被动监听主循环（动态范围、速度平滑、过滤、锁定）
 -- ==========================================
 local function passiveListenerLoop()
     local pollTick = 0
@@ -737,55 +635,42 @@ local function passiveListenerLoop()
     while true do
         if currentScreenTab==2 then sleep(0.5)
         else
-            -- 外设轮询
             if pollTick<=0 then
                 pollTick = 20
                 if not cachedServo then cachedServo = peripheral.find("servo") end
-                -- Camera 丢失重连
                 if not camera then
                     for _, name in ipairs(peripheral.getNames()) do
                         if peripheral.getType(name) == "camera" then
-                            camera     = peripheral.wrap(name)
-                            cameraName = name
-                            break
+                            camera = peripheral.wrap(name); cameraName = name; break
                         end
                     end
                 end
-            else
-                pollTick = pollTick-1
-            end
+            else pollTick = pollTick-1 end
 
-            -- 舵机角度
             if cachedServo then
                 local ok, ang = pcall(cachedServo.getAngle)
                 if ok and type(ang)=="number" then
                     isServoConnected = true
                     currentServoAngle = (math_deg(ang) + motorOffset) % 360
-                else
-                    isServoConnected = false
-                    cachedServo = nil
-                end
-            else
-                isServoConnected = false
-            end
+                else isServoConnected = false; cachedServo = nil end
+            else isServoConnected = false end
 
-            -- 获取相机位置
             local ok, pos = pcall(camera.getCameraPosition)
             if ok then localPos = pos else localPos = nil end
 
-            -- 固定探测距离
-            currentPassiveRange = FIXED_RANGE
+            -- 动态范围计算
+            if localPos then
+                local depth = math_max(0, (SEA_LEVEL_Y - localPos.y))
+                currentPassiveRange = math_min(RANGE_DEEP, math_max(RANGE_SURFACE,
+                    RANGE_SURFACE + 400 * depth))
+            end
 
-            -- 计算船头朝向
             if not isHeadless then
-                pcall(function()
-                    currentQAbs = camera.getAbsViewTransform()
-                    currentQLoc = camera.getLocViewTransform()
-                end)
+                pcall(function() currentQAbs=camera.getAbsViewTransform(); currentQLoc=camera.getLocViewTransform() end)
                 if currentQAbs and currentQLoc then
-                    local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                    local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
                     local hx,hy,hz = rotateVectorFast(0,0,-1, iqx,iqy,iqz,iqw)
-                    local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                    local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
                     currentNorthYawDeg = math_deg(math_atan2(-sx, sz))
                 end
             end
@@ -800,14 +685,10 @@ local function passiveListenerLoop()
                         local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
                         data.realDist = dist
 
-                        -- 速度平滑：5秒滑动窗口
-                        if not data.posHistory then
-                            data.posHistory = {}
-                        end
+                        -- 速度平滑窗口
+                        if not data.posHistory then data.posHistory = {} end
                         table.insert(data.posHistory, {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z, t=now})
-                        while #data.posHistory > 0 and now - data.posHistory[1].t > 5.0 do
-                            table.remove(data.posHistory, 1)
-                        end
+                        while #data.posHistory > 0 and now - data.posHistory[1].t > 5.0 do table.remove(data.posHistory, 1) end
 
                         local interval = (id == selectedTargetId) and SPEED_CALC_INTERVAL or QUICK_SPEED_INTERVAL
                         if not data.speedLastCalc or (now - data.speedLastCalc >= interval) then
@@ -819,28 +700,24 @@ local function passiveListenerLoop()
                                 local ddy = newest.y - oldest.y
                                 local ddz = newest.z - oldest.z
                                 data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
-                                if dist > 0.01 then
-                                    data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
-                                else
-                                    data.radialSpeed = 0
-                                end
+                                if dist > 0.01 then data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                else data.radialSpeed = 0 end
                                 data.speedLastCalc = now
-                                data.posHistory = {}  -- 清空窗口，重新累积
+                                data.posHistory = {}
                             end
                         end
 
-                        -- 距离过滤
                         if id ~= selectedTargetId and dist > currentPassiveRange then
                             data.lastPainted = nil
                         else
                             local tYaw
                             if currentQAbs and currentQLoc then
-                                local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                                local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
                                 local hx,hy,hz = rotateVectorFast(dx,dy,dz, iqx,iqy,iqz,iqw)
-                                local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                                local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
                                 tYaw = math_deg(math_atan2(-sx, sz))
                             else
-                                _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, data.realPos.x, data.realPos.y, data.realPos.z)
+                                _, tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, data.realPos.x,data.realPos.y,data.realPos.z)
                             end
                             data.paintedYaw = tYaw
                             data.paintedDist = dist
@@ -849,31 +726,19 @@ local function passiveListenerLoop()
                                 data.lastPainted = now
                             else
                                 local inSector = true
-                                if isServoConnected then
-                                    inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2
-                                end
+                                if isServoConnected then inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2 end
                                 if inSector then
-                                    if not data.sectorEnterTime then
-                                        data.sectorEnterTime = now
-                                    end
-                                    local elapsed = now - data.sectorEnterTime
-                                    if elapsed >= LISTEN_HOLD_TIME then
-                                        if data.speed and data.speed > minSpeedMPS then
-                                            data.lastPainted = now
-                                        else
-                                            data.lastPainted = nil
-                                        end
+                                    if not data.sectorEnterTime then data.sectorEnterTime = now end
+                                    if now - data.sectorEnterTime >= LISTEN_HOLD_TIME then
+                                        if data.speed and data.speed > minSpeedMPS then data.lastPainted = now else data.lastPainted = nil end
                                         data.sectorEnterTime = nil
                                     end
-                                else
-                                    data.sectorEnterTime = nil
-                                end
+                                else data.sectorEnterTime = nil end
                             end
                         end
                     end
                 end
             end
-            -- 清理过期目标
             for id, data in pairs(targets) do
                 if data.lastSeen and (now - data.lastSeen > TARGET_FADE_DURATION) then
                     targets[id] = nil
@@ -891,10 +756,10 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v1.9 - OK")
-print("  Name : " .. myLabel)
-print("  Fixed Range: " .. FIXED_RANGE .. "m")
-print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h")
+print("GHG Sonar v2.1 - Passive")
+print("ID: " .. myLabel)
+print("Dynamic Range (y="..SEA_LEVEL_Y..": "..RANGE_SURFACE.."m, y="..DEEP_Y..": "..RANGE_DEEP.."m)")
+print("Heartbeat active (t=7)")
 sleep(1.0)
 
 parallel.waitForAll(
@@ -902,6 +767,7 @@ parallel.waitForAll(
     hudMonitorUI,
     termUI,
     inputLoop,
+    heartbeatLoop,
     listenLoop,
     passiveListenerLoop,
     iffToggleLoop
