@@ -468,37 +468,44 @@ local function gpuDrawListeningLine(entry, angleDeg)
 end
 local function gpuDrawTargetLine(entry, yawRad, color, targetData)
     local g, cx, cy, r = entry.gpu, entry.cx, entry.cy, entry.r
-    local ex = cx + math_floor(r*math_sin(yawRad)+0.5)
-    local ey = cy - math_floor(r*math_cos(yawRad)+0.5)
-    g.line(cx,cy,ex,ey,color)
+    local ex = cx + math_floor(r * math_sin(yawRad) + 0.5)
+    local ey = cy - math_floor(r * math_cos(yawRad) + 0.5)
+    g.line(cx, cy, ex, ey, color)
     if targetData then
-        local absBearing = (targetData.paintedYaw + 360) % 360
-        local relBearing = (absBearing - (yawOffset or 0) + 360) % 360
+        -- 相对方位 = paintedYaw，绝对方位 = 相对 + 船头朝向 + 偏移
+        local relBearing = (targetData.paintedYaw + 360) % 360
+        local absBearing = (relBearing + currentNorthYawDeg + yawOffset + 360) % 360
         local speedStr = targetData.speed and string.format("%.1f", targetData.speed) or "?"
         local radial = radialSymbol(targetData.radialSpeed)
         local text = string.format("%03d/%03d %s%s", relBearing, absBearing, speedStr, radial)
-        local tx = math_max(1, math_min(entry.w-1, ex + 8*math_sin(yawRad)))
-        local ty = math_max(1, math_min(entry.h-1, ey - 8*math_cos(yawRad)))
+        local tx = math_max(1, math_min(entry.w - 1, ex + 8 * math_sin(yawRad)))
+        local ty = math_max(1, math_min(entry.h - 1, ey - 8 * math_cos(yawRad)))
         pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 0)
     end
 end
 local function gpuRefreshSonar(entry)
-    gpuDrawSonarBase(entry)
-    if isServoConnected then gpuDrawListeningLine(entry, currentServoAngle) end
+    gpuDrawSonarBase(entry)  -- 刻度盘已含 currentNorthYawDeg，指北
+    if isServoConnected then
+        -- 监听箭头：相对船头方向，直接使用当前舵机角度
+        gpuDrawListeningLine(entry, currentServoAngle)
+    end
     local now = os_clock()
     for id, data in pairs(targets) do
         local isLocked = (id == selectedTargetId)
         if isLocked and data.paintedYaw then
+            -- 目标线：相对船头，yawRad = paintedYaw + yawOffset
             gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.LOCKED_LINE, data)
-        elseif data.lastPainted and (now-data.lastPainted < TARGET_FADE_DURATION) and data.speed and data.speed > 0.1 then
-            local col = calcFadeColor(now-data.lastPainted, C.ALLY_HOT)
-            if col then gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.TARGET_LINE, data) end
+        elseif data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION)
+               and data.speed and data.speed > 0.1 then
+            local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
+            if col then
+                gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.TARGET_LINE, data)
+            end
         end
     end
     gpuDrawIffCorners(entry)
     entry.gpu.sync()
 end
-
 -- ==========================================
 -- GPU 主循环
 -- ==========================================
@@ -791,7 +798,7 @@ local function passiveListenerLoop()
                                     local spd = math_sqrt(ddx*ddx+ddy*ddy+ddz*ddz)/dt
                                     data.speed = spd
                                     if dist>0.01 then data.radialSpeed = (ddx*dx+ddy*dy+ddz*dz)/(dist*dt) else data.radialSpeed=0 end
-                                    if spd > 0.1 then
+                                   if spd >= 0.0 then
                                         data.lastPainted = now
                                         data.speedLastPos = {x=data.realPos.x,y=data.realPos.y,z=data.realPos.z}
                                         data.speedLastTime = now
