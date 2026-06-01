@@ -268,13 +268,15 @@ local function initGpuList()
             else dotSize = 1 end
             if bw >= 3 and bh >= 3 then dotSize = dotSize + 1 end
             dotSize = math_max(2, dotSize)
-            table.insert(sonarGpuList, {
+            local entry = {
                 gpu=g, name=name, w=w, h=h, cx=cx, cy=cy, r=r,
                 bw=bw, bh=bh, dotSize=dotSize,
-            })
-            gpuNameMap[name] = {gpu=g, cx=cx, cy=cy, r=r, w=w, h=h, dotSize=dotSize}
+            }
+            table.insert(sonarGpuList, entry)
+            gpuNameMap[name] = entry
         end
     end
+    print("DEBUG: Sonar GPU count = " .. #sonarGpuList)
 end
 initGpuList()
 
@@ -560,19 +562,21 @@ end
 -- 声纳 GPU 主循环
 -- ==========================================
 local function sonarGpuUI()
-    if #sonarGpuList == 0 then return end
+    if #sonarGpuList == 0 then
+        print("WARNING: No sonar GPU found!")
+        return
+    end
     while true do
         if currentScreenTab == 2 then
             sleep(0.3)
         else
             for _, entry in ipairs(sonarGpuList) do
-                pcall(gpuRefreshSonar, entry)
+                gpuRefreshSonar(entry)   -- 暂时不用 pcall，让错误直接显示
             end
             sleep(0.05)
         end
     end
 end
-
 -- ==========================================
 -- HUD 主循环
 -- ==========================================
