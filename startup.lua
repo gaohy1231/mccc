@@ -1,19 +1,26 @@
---[[ GHG 被动定向水听器 v1.3.1
-    界面：黑底黄绿配色，四方位标记 + 45°刻度，白色监听箭头
-    逻辑：仅被动接收，舵机定向监听，1秒停留即显示，静音目标可见
+--[[ GHG 被动定向水听器 v1.5
+     完全被动接收，定向监听，动态探测距离（1km~5km），
+     仅显示速度 > 4 km/h 的目标，锁定目标不受限。
 --]]
 
 -- ==========================================
 --  全局配置
 -- ==========================================
-local PASSIVE_MAX_RANGE        = 5000.0
+local PASSIVE_MAX_RANGE        = 5000.0   -- 理论最大距离（深潜时）
 local CHANNEL                  = 8888
 local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
 local LISTEN_SECTOR_WIDTH      = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_CALC_INTERVAL      = 3.0
-local LISTEN_HOLD_TIME         = 1.0    -- 停留 1 秒即显示
+local SPEED_CALC_INTERVAL      = 3.0      -- 测速间隔
+local LISTEN_HOLD_TIME         = 1.0      -- 停留 1 秒即检测
+local MIN_SPEED_KMH            = 4.0      -- 最小显示速度 (km/h)
+
+-- 深度→范围映射
+local SEA_LEVEL_Y    = -4
+local RANGE_SURFACE  = 1000
+local RANGE_DEEP     = 5000
+local DEEP_Y         = -14
 
 -- ==========================================
 -- 外设初始化
@@ -104,7 +111,8 @@ local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
 local iffMode               = "enemy"
-local currentNorthYawDeg    = 0     -- 船头绝对朝向
+local currentNorthYawDeg    = 0
+local currentPassiveRange   = RANGE_SURFACE
 
 -- ==========================================
 --  配置文件
@@ -269,7 +277,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1,1)
     term.setTextColor(colors.cyan)
-    print("GHG Sonar v1.3.1 - Registration Check")
+    print("GHG Sonar v1.5 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -294,9 +302,8 @@ local function checkRegistration()
                 if d.t==5 and d.ti==myId then
                     os.cancelTimer(timer)
                     myLabel = tostring(d.n or myLabel)
-                    PASSIVE_MAX_RANGE = tonumber(d.r) or PASSIVE_MAX_RANGE
                     term.setTextColor(colors.lime)
-                    print(string.format("Registered! Name: %s  MaxRange: %.0fm", myLabel, PASSIVE_MAX_RANGE))
+                    print(string.format("Registered! Name: %s", myLabel))
                     sleep(0.8)
                     return true
                 elseif d.t==6 and d.ti==myId then
@@ -475,12 +482,11 @@ local function gpuDrawTargetLine(entry, yawRad, color, targetData)
     local ey = cy - math_floor(r * math_cos(yawRad) + 0.5)
     g.line(cx, cy, ex, ey, color)
     if targetData then
-        -- 相对方位 = paintedYaw，绝对方位 = 相对 + 船头朝向 + 偏移
         local relBearing = (targetData.paintedYaw + 360) % 360
         local absBearing = (relBearing + currentNorthYawDeg + yawOffset + 360) % 360
-        local speedStr = targetData.speed and string.format("%.1f", targetData.speed) or "?"
+        local speedStr = targetData.speed and string.format("%.1f", targetData.speed*3.6) or "?"
         local radial = radialSymbol(targetData.radialSpeed)
-        local text = string.format("%03d/%03d %s%s", relBearing, absBearing, speedStr, radial)
+        local text = string.format("%03d/%03d %skm/h%s", relBearing, absBearing, speedStr, radial)
         local tx = math_max(1, math_min(entry.w - 1, ex + 8 * math_sin(yawRad)))
         local ty = math_max(1, math_min(entry.h - 1, ey - 8 * math_cos(yawRad)))
         pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 0)
@@ -489,7 +495,6 @@ end
 local function gpuRefreshSonar(entry)
     gpuDrawSonarBase(entry)
     if isServoConnected then
-        -- 监听箭头：相对船头方向
         gpuDrawListeningLine(entry, currentServoAngle)
     end
     local now = os_clock()
@@ -525,7 +530,7 @@ local function sonarGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环
+-- HUD 主循环（速度 km/h，布局优化）
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList == 0 then return end
@@ -535,22 +540,25 @@ local function hudMonitorUI()
         for _,info in ipairs(hudMonitorList) do
             if info.mode=="STATUS" then
                 local sText, sColor = "PASSIVE", colors.green
-                local rText, rColor = string.format("%dm", math_floor(PASSIVE_MAX_RANGE)), colors.lime
+                local rText, rColor = string.format("%dm", math_floor(currentPassiveRange)), colors.lime
                 local lText, lColor, dText, dColor
                 if selectedTargetId and targets[selectedTargetId] then
                     local sel = targets[selectedTargetId]
                     local relB = (sel.paintedYaw + 360) % 360
                     local absB = (relB + currentNorthYawDeg + yawOffset + 360) % 360
-                    local dist = string.format("%.0fm", sel.paintedDist or 0)
-                    local spd  = sel.speed and string.format("%.1fm/s", sel.speed) or "?m/s"
+                    local distStr = string.format("%.0fm", sel.paintedDist or 0)
+                    local spdStr  = sel.speed and string.format("%.1fkm/h", sel.speed*3.6) or "?km/h"
                     local idStr = tostring(sel.name or "??")
-                    lText = "TRACK"; lColor = colors.red
-                    dText = string.format("%s %s %03d/%03d %s%s", dist, idStr, relB, absB, spd, radialSymbol(sel.radialSpeed))
+                    lText = idStr .. " " .. distStr
+                    lColor = (sel.iff=="friendly") and colors.green or
+                             (sel.iff=="enemy") and colors.red or colors.yellow
+                    dText = string.format("%03d/%03d %s%s", relB, absB, spdStr, radialSymbol(sel.radialSpeed))
                 else
                     lText = "LISTEN"; lColor = colors.lightGray
                     dText = "---"
                 end
-                if frames<=2 or sText~=info.lastSText or rText~=info.lastRText or lText~=info.lastLText or dText~=info.lastDText then
+                if frames<=2 or sText~=info.lastSText or rText~=info.lastRText
+                    or lText~=info.lastLText or dText~=info.lastDText then
                     info.m.setBackgroundColor(colors.black); info.m.clear()
                     local dw,dh = info.m.getSize()
                     local function drawCL(txt,col,y) info.m.setTextColor(col); info.m.setCursorPos(math_max(1,(dw-#txt)/2+1),y); info.m.write(txt) end
@@ -633,7 +641,7 @@ local function termUI()
             drawInputBox(6, "Motor Offset:", motorOffset, menuIndex==2, isEditing)
             term.setCursorPos(2,10); term.setTextColor(colors.yellow); term.write("=== SYSTEM STATUS ===")
             term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write(string.format("Registered: %s", myLabel))
-            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write(string.format("Max Range : %.0f m", PASSIVE_MAX_RANGE))
+            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write(string.format("Max Range : %.0f m", currentPassiveRange))
             term.setCursorPos(2,16)
             if isServoConnected then term.setTextColor(colors.white); term.write(string.format("Listen Dir: %6.1f deg", currentServoAngle))
             else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
@@ -732,10 +740,11 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 被动监听主循环（定向、停留、测速）
+-- 被动监听主循环（定向、深度范围、停留1秒、速度>4km/h）
 -- ==========================================
 local function passiveListenerLoop()
     local pollTick = 0
+    local minSpeedMPS = MIN_SPEED_KMH / 3.6   -- 1.111 m/s
     while true do
         if currentScreenTab==2 then sleep(0.5)
         else
@@ -760,12 +769,19 @@ local function passiveListenerLoop()
 
             local ok, pos = pcall(camera.getCameraPosition)
             if ok then localPos = pos else localPos = nil end
+
+            -- 动态计算当前水听范围
+            if localPos then
+                local depth = math_max(0, (SEA_LEVEL_Y - localPos.y))
+                currentPassiveRange = math_min(RANGE_DEEP, math_max(RANGE_SURFACE,
+                    RANGE_SURFACE + 400 * depth))
+            end
+
             if not isHeadless then
                 pcall(function()
                     currentQAbs = camera.getAbsViewTransform()
                     currentQLoc = camera.getLocViewTransform()
                 end)
-                -- 计算船头绝对朝向
                 if currentQAbs and currentQLoc then
                     local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
                     local hx,hy,hz = rotateVectorFast(0,0,-1, iqx,iqy,iqz,iqw)
@@ -783,87 +799,98 @@ local function passiveListenerLoop()
                         local dz = data.realPos.z - localPos.z
                         local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
                         data.realDist = dist
-                        local tYaw
-                        if currentQAbs and currentQLoc then
-                            local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
-                            local hx,hy,hz = rotateVectorFast(dx,dy,dz, iqx,iqy,iqz,iqw)
-                            local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
-                            tYaw = math_deg(math_atan2(-sx, sz))
-                        else
-                            _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, data.realPos.x, data.realPos.y, data.realPos.z)
-                        end
-                        data.paintedYaw = tYaw
-                        data.paintedDist = dist
 
-                        if id == selectedTargetId then
-                            data.lastPainted = now
-                            if not data.speedLastCalc or (now - data.speedLastCalc >= SPEED_CALC_INTERVAL) then
-                                if data.speedLastPos and data.speedLastTime then
-                                    local dt = now - data.speedLastTime
-                                    if dt > 0.1 then
-                                        local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
-                                        local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
-                                        data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
-                                        if dist > 0.01 then
-                                            data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
-                                        else
-                                            data.radialSpeed = 0
+                        if id ~= selectedTargetId and dist > currentPassiveRange then
+                            data.lastPainted = nil
+                        else
+                            local tYaw
+                            if currentQAbs and currentQLoc then
+                                local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                                local hx,hy,hz = rotateVectorFast(dx,dy,dz, iqx,iqy,iqz,iqw)
+                                local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                                tYaw = math_deg(math_atan2(-sx, sz))
+                            else
+                                _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, data.realPos.x, data.realPos.y, data.realPos.z)
+                            end
+                            data.paintedYaw = tYaw
+                            data.paintedDist = dist
+
+                            if id == selectedTargetId then
+                                data.lastPainted = now
+                                if not data.speedLastCalc or (now - data.speedLastCalc >= SPEED_CALC_INTERVAL) then
+                                    if data.speedLastPos and data.speedLastTime then
+                                        local dt = now - data.speedLastTime
+                                        if dt > 0.1 then
+                                            local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
+                                            local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
+                                            data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                            if dist > 0.01 then
+                                                data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                            else
+                                                data.radialSpeed = 0
+                                            end
                                         end
                                     end
-                                end
-                                data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
-                                data.speedLastTime = now
-                                data.speedLastCalc = now
-                            end
-                        else
-                            local inSector = true
-                            if isServoConnected then
-                                inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2
-                            end
-                            if inSector then
-                                if not data.sectorEnterTime then
-                                    data.sectorEnterTime = now
-                                    data.sectorEnterPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
-                                end
-                                local elapsed = now - data.sectorEnterTime
-                                if elapsed >= LISTEN_HOLD_TIME then
-                                    local dt = elapsed
-                                    local lx,ly,lz = data.sectorEnterPos.x, data.sectorEnterPos.y, data.sectorEnterPos.z
-                                    local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
-                                    local spd = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
-                                    data.speed = spd
-                                    if dist > 0.01 then
-                                        data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
-                                    else
-                                        data.radialSpeed = 0
-                                    end
-                                    data.lastPainted = now
                                     data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
                                     data.speedLastTime = now
                                     data.speedLastCalc = now
-                                    data.sectorEnterTime = nil
                                 end
                             else
-                                data.sectorEnterTime = nil
-                            end
-                            -- 持续测速更新
-                            if data.lastPainted and (now - (data.speedLastCalc or 0) >= SPEED_CALC_INTERVAL) then
-                                if data.speedLastPos and data.speedLastTime then
-                                    local dt = now - data.speedLastTime
-                                    if dt > 0.1 then
-                                        local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
+                                local inSector = true
+                                if isServoConnected then
+                                    inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2
+                                end
+                                if inSector then
+                                    if not data.sectorEnterTime then
+                                        data.sectorEnterTime = now
+                                        data.sectorEnterPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
+                                    end
+                                    local elapsed = now - data.sectorEnterTime
+                                    if elapsed >= LISTEN_HOLD_TIME then
+                                        local dt = elapsed
+                                        local lx,ly,lz = data.sectorEnterPos.x, data.sectorEnterPos.y, data.sectorEnterPos.z
                                         local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
-                                        data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                        local spd = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                        data.speed = spd
                                         if dist > 0.01 then
                                             data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
                                         else
                                             data.radialSpeed = 0
                                         end
+                                        if spd > minSpeedMPS then
+                                            data.lastPainted = now
+                                            data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
+                                            data.speedLastTime = now
+                                            data.speedLastCalc = now
+                                        else
+                                            data.lastPainted = nil
+                                        end
+                                        data.sectorEnterTime = nil
                                     end
+                                else
+                                    data.sectorEnterTime = nil
                                 end
-                                data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
-                                data.speedLastTime = now
-                                data.speedLastCalc = now
+                                if data.lastPainted and (now - (data.speedLastCalc or 0) >= SPEED_CALC_INTERVAL) then
+                                    if data.speedLastPos and data.speedLastTime then
+                                        local dt = now - data.speedLastTime
+                                        if dt > 0.1 then
+                                            local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
+                                            local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
+                                            data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                            if dist > 0.01 then
+                                                data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                            else
+                                                data.radialSpeed = 0
+                                            end
+                                            if data.speed <= minSpeedMPS then
+                                                data.lastPainted = nil
+                                            end
+                                        end
+                                    end
+                                    data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
+                                    data.speedLastTime = now
+                                    data.speedLastCalc = now
+                                end
                             end
                         end
                     end
@@ -887,11 +914,10 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v1.3.1 - OK")
+print("GHG Sonar v1.5 - OK")
 print("  Name : " .. myLabel)
-print("  Range: " .. PASSIVE_MAX_RANGE .. "m")
-print("  Sector: " .. LISTEN_SECTOR_WIDTH .. "deg, Hold: " .. LISTEN_HOLD_TIME .. "s")
-print("  Speeds shown even if zero.")
+print("  Dynamic Range (y=-4:1000m, y=-14:5000m)")
+print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h")
 sleep(1.0)
 
 parallel.waitForAll(
