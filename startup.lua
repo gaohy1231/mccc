@@ -1,6 +1,6 @@
---[[ GHG 被动定向水听器 v1.3
+--[[ GHG 被动定向水听器 v1.3.1
     界面：黑底黄绿配色，四方位标记 + 45°刻度，白色监听箭头
-    逻辑：仅被动接收，舵机定向监听，3秒停留测速，静止目标不显示
+    逻辑：仅被动接收，舵机定向监听，1秒停留即显示，静音目标可见
 --]]
 
 -- ==========================================
@@ -13,7 +13,7 @@ local TARGET_HOT_DURATION      = 2.0
 local LISTEN_SECTOR_WIDTH      = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
 local SPEED_CALC_INTERVAL      = 3.0
-local LISTEN_HOLD_TIME         = 3.0    -- 停留3秒才显示（可调小测试）
+local LISTEN_HOLD_TIME         = 1.0    -- 停留 1 秒即显示
 
 -- ==========================================
 -- 外设初始化
@@ -104,6 +104,7 @@ local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
 local iffMode               = "enemy"
+local currentNorthYawDeg    = 0     -- 船头绝对朝向
 
 -- ==========================================
 --  配置文件
@@ -175,6 +176,7 @@ local function pointToSegmentSq(px, py, p1x, p1y, p2x, p2y)
     local nearX, nearY = p1x + t*dx, p1y + t*dy
     return (px-nearX)^2 + (py-nearY)^2
 end
+
 -- ==========================================
 -- 颜色常量（黑底黄绿主题）
 -- ==========================================
@@ -267,7 +269,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1,1)
     term.setTextColor(colors.cyan)
-    print("GHG Sonar v1.3 - Registration Check")
+    print("GHG Sonar v1.3.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -394,6 +396,7 @@ term.setCursorPos(1,1)
 term.setTextColor(colors.green)
 print("Registration OK. Starting GHG sonar...")
 sleep(0.5)
+
 -- ==========================================
 -- GPU 绘制函数
 -- ==========================================
@@ -434,10 +437,10 @@ local function gpuDrawSonarBase(entry)
             if (cx-t-cx)^2 + (py-cy)^2 <= r*r then g.line(cx-t,py,cx-t,py,C.GRID) end
         end
     end
-    -- 四个方向字母 + 45°刻度
+    -- 四个方向字母 + 45°刻度，始终指向绝对北
     local labels = {[0]="N", [90]="E", [180]="S", [270]="W"}
     for deg=0,315,45 do
-        local rad = math_rad(deg + yawOffset)
+        local rad = math_rad(deg + currentNorthYawDeg + yawOffset)
         local sinA, cosA = math_sin(rad), math_cos(rad)
         local x0 = cx + math_floor((r-6)*sinA+0.5)
         local y0 = cy - math_floor((r-6)*cosA+0.5)
@@ -484,19 +487,17 @@ local function gpuDrawTargetLine(entry, yawRad, color, targetData)
     end
 end
 local function gpuRefreshSonar(entry)
-    gpuDrawSonarBase(entry)  -- 刻度盘已含 currentNorthYawDeg，指北
+    gpuDrawSonarBase(entry)
     if isServoConnected then
-        -- 监听箭头：相对船头方向，直接使用当前舵机角度
+        -- 监听箭头：相对船头方向
         gpuDrawListeningLine(entry, currentServoAngle)
     end
     local now = os_clock()
     for id, data in pairs(targets) do
         local isLocked = (id == selectedTargetId)
         if isLocked and data.paintedYaw then
-            -- 目标线：相对船头，yawRad = paintedYaw + yawOffset
             gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.LOCKED_LINE, data)
-        elseif data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION)
-               and data.speed and data.speed > 0.1 then
+        elseif data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
             local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
             if col then
                 gpuDrawTargetLine(entry, math_rad(data.paintedYaw + yawOffset), C.TARGET_LINE, data)
@@ -506,6 +507,7 @@ local function gpuRefreshSonar(entry)
     gpuDrawIffCorners(entry)
     entry.gpu.sync()
 end
+
 -- ==========================================
 -- GPU 主循环
 -- ==========================================
@@ -513,12 +515,17 @@ local function sonarGpuUI()
     if #sonarGpuList == 0 then return end
     while true do
         if currentScreenTab == 2 then sleep(0.3)
-        else for _,e in ipairs(sonarGpuList) do pcall(gpuRefreshSonar, e) end sleep(0.05) end
+        else
+            for _,e in ipairs(sonarGpuList) do
+                pcall(gpuRefreshSonar, e)
+            end
+            sleep(0.05)
+        end
     end
 end
 
 -- ==========================================
--- HUD 主循环（略改，显示方位速度）
+-- HUD 主循环
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList == 0 then return end
@@ -532,8 +539,8 @@ local function hudMonitorUI()
                 local lText, lColor, dText, dColor
                 if selectedTargetId and targets[selectedTargetId] then
                     local sel = targets[selectedTargetId]
-                    local relB = (sel.paintedYaw - yawOffset + 360) % 360
-                    local absB = (sel.paintedYaw + 360) % 360
+                    local relB = (sel.paintedYaw + 360) % 360
+                    local absB = (relB + currentNorthYawDeg + yawOffset + 360) % 360
                     local dist = string.format("%.0fm", sel.paintedDist or 0)
                     local spd  = sel.speed and string.format("%.1fm/s", sel.speed) or "?m/s"
                     local idStr = tostring(sel.name or "??")
@@ -543,7 +550,6 @@ local function hudMonitorUI()
                     lText = "LISTEN"; lColor = colors.lightGray
                     dText = "---"
                 end
-                -- 刷新判断
                 if frames<=2 or sText~=info.lastSText or rText~=info.lastRText or lText~=info.lastLText or dText~=info.lastDText then
                     info.m.setBackgroundColor(colors.black); info.m.clear()
                     local dw,dh = info.m.getSize()
@@ -567,7 +573,7 @@ local function termUI()
     while true do
         term.setBackgroundColor(colors.black)
         term.clear()
-               if currentScreenTab==2 then
+        if currentScreenTab==2 then
             term.setCursorPos(2,2); term.setTextColor(colors.lightGray)
             term.write("=== CONNECTED DISPLAYS ===")
             local r = 4
@@ -668,8 +674,6 @@ local function inputLoop()
             if (p1>='0' and p1<='9') or p1=='.' or (p1=='-' and #inputStr==0) then
                 if #inputStr<8 then inputStr = inputStr..p1 end
             end
-        elseif event=="mouse_click" then
-            -- 终端菜单点击逻辑（略）
         elseif (event=="tm_monitor_touch" or event=="tm_monitor_mouse_click") and currentScreenTab==1 then
             local entry = gpuNameMap[p1]
             if entry then
@@ -700,7 +704,10 @@ local function listenLoop()
         if ch==CHANNEL and type(msg)=="table" and msg.v==2 and msg.t==1 and msg.i~=myId then
             if not targets[msg.i] then targets[msg.i] = {name=msg.n} end
             local t = targets[msg.i]
-            if t.realPos then t.speedLastPos = {x=t.realPos.x, y=t.realPos.y, z=t.realPos.z}; t.speedLastTime = os_clock() end
+            if t.realPos then
+                t.speedLastPos = {x=t.realPos.x, y=t.realPos.y, z=t.realPos.z}
+                t.speedLastTime = os_clock()
+            end
             t.realPos = {x=msg.x, y=msg.y, z=msg.z}
             t.modemDist = dist
             t.realDist = calcRangingDist(localPos, t.realPos) or dist
@@ -718,7 +725,9 @@ local function iffToggleLoop()
     while true do
         os_pullEvent("redstone")
         local newBack = redstone.getInput("back")
-        if newBack and not lastBack then iffMode = (iffMode=="enemy") and "friendly" or "enemy" end
+        if newBack and not lastBack then
+            iffMode = (iffMode=="enemy") and "friendly" or "enemy"
+        end
         lastBack = newBack
     end
 end
@@ -734,57 +743,84 @@ local function passiveListenerLoop()
             if pollTick<=0 then
                 pollTick = 20
                 if not cachedServo then cachedServo = peripheral.find("servo") end
-            else pollTick = pollTick-1 end
+            else
+                pollTick = pollTick-1
+            end
             if cachedServo then
                 local ok, ang = pcall(cachedServo.getAngle)
                 if ok and type(ang)=="number" then
                     isServoConnected = true
                     currentServoAngle = (math_deg(ang) + motorOffset) % 360
-                else isServoConnected = false; cachedServo = nil end
-            else isServoConnected = false end
+                else
+                    isServoConnected = false
+                    cachedServo = nil
+                end
+            else
+                isServoConnected = false
+            end
 
             local ok, pos = pcall(camera.getCameraPosition)
             if ok then localPos = pos else localPos = nil end
-            if not isHeadless then pcall(function() currentQAbs=camera.getAbsViewTransform(); currentQLoc=camera.getLocViewTransform() end) end
+            if not isHeadless then
+                pcall(function()
+                    currentQAbs = camera.getAbsViewTransform()
+                    currentQLoc = camera.getLocViewTransform()
+                end)
+                -- 计算船头绝对朝向
+                if currentQAbs and currentQLoc then
+                    local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                    local hx,hy,hz = rotateVectorFast(0,0,-1, iqx,iqy,iqz,iqw)
+                    local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                    currentNorthYawDeg = math_deg(math_atan2(-sx, sz))
+                end
+            end
 
             local now = os_clock()
             if localPos then
                 for id, data in pairs(targets) do
                     if data.realPos then
-                        local dx, dy, dz = data.realPos.x-localPos.x, data.realPos.y-localPos.y, data.realPos.z-localPos.z
-                        local dist = math_sqrt(dx*dx+dy*dy+dz*dz)
+                        local dx = data.realPos.x - localPos.x
+                        local dy = data.realPos.y - localPos.y
+                        local dz = data.realPos.z - localPos.z
+                        local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
                         data.realDist = dist
                         local tYaw
                         if currentQAbs and currentQLoc then
-                            local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
-                            local hx,hy,hz = rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
-                            local sx,sy,sz = rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                            tYaw = math_deg(math_atan2(-sx,sz))
+                            local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                            local hx,hy,hz = rotateVectorFast(dx,dy,dz, iqx,iqy,iqz,iqw)
+                            local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                            tYaw = math_deg(math_atan2(-sx, sz))
                         else
-                            _, tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, data.realPos.x,data.realPos.y,data.realPos.z)
+                            _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, data.realPos.x, data.realPos.y, data.realPos.z)
                         end
                         data.paintedYaw = tYaw
                         data.paintedDist = dist
 
                         if id == selectedTargetId then
                             data.lastPainted = now
-                            if not data.speedLastCalc or (now-data.speedLastCalc >= SPEED_CALC_INTERVAL) then
+                            if not data.speedLastCalc or (now - data.speedLastCalc >= SPEED_CALC_INTERVAL) then
                                 if data.speedLastPos and data.speedLastTime then
                                     local dt = now - data.speedLastTime
-                                    if dt>0.1 then
+                                    if dt > 0.1 then
                                         local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
-                                        local ddx,ddy,ddz = data.realPos.x-lx, data.realPos.y-ly, data.realPos.z-lz
-                                        data.speed = math_sqrt(ddx*ddx+ddy*ddy+ddz*ddz)/dt
-                                        if dist>0.01 then data.radialSpeed = (ddx*dx+ddy*dy+ddz*dz)/(dist*dt) else data.radialSpeed=0 end
+                                        local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
+                                        data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                        if dist > 0.01 then
+                                            data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                        else
+                                            data.radialSpeed = 0
+                                        end
                                     end
                                 end
-                                data.speedLastPos = {x=data.realPos.x,y=data.realPos.y,z=data.realPos.z}
+                                data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
                                 data.speedLastTime = now
                                 data.speedLastCalc = now
                             end
                         else
                             local inSector = true
-                            if isServoConnected then inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2 end
+                            if isServoConnected then
+                                inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2
+                            end
                             if inSector then
                                 if not data.sectorEnterTime then
                                     data.sectorEnterTime = now
@@ -794,36 +830,39 @@ local function passiveListenerLoop()
                                 if elapsed >= LISTEN_HOLD_TIME then
                                     local dt = elapsed
                                     local lx,ly,lz = data.sectorEnterPos.x, data.sectorEnterPos.y, data.sectorEnterPos.z
-                                    local ddx,ddy,ddz = data.realPos.x-lx, data.realPos.y-ly, data.realPos.z-lz
-                                    local spd = math_sqrt(ddx*ddx+ddy*ddy+ddz*ddz)/dt
+                                    local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
+                                    local spd = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
                                     data.speed = spd
-                                    if dist>0.01 then data.radialSpeed = (ddx*dx+ddy*dy+ddz*dz)/(dist*dt) else data.radialSpeed=0 end
-                                   if spd >= 0.0 then
-                                        data.lastPainted = now
-                                        data.speedLastPos = {x=data.realPos.x,y=data.realPos.y,z=data.realPos.z}
-                                        data.speedLastTime = now
-                                        data.speedLastCalc = now
+                                    if dist > 0.01 then
+                                        data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
                                     else
-                                        data.lastPainted = nil
+                                        data.radialSpeed = 0
                                     end
+                                    data.lastPainted = now
+                                    data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
+                                    data.speedLastTime = now
+                                    data.speedLastCalc = now
                                     data.sectorEnterTime = nil
                                 end
                             else
                                 data.sectorEnterTime = nil
                             end
                             -- 持续测速更新
-                            if data.lastPainted and (now-(data.speedLastCalc or 0) >= SPEED_CALC_INTERVAL) then
+                            if data.lastPainted and (now - (data.speedLastCalc or 0) >= SPEED_CALC_INTERVAL) then
                                 if data.speedLastPos and data.speedLastTime then
                                     local dt = now - data.speedLastTime
-                                    if dt>0.1 then
-                                        local lx,ly,lz = data.speedLastPos.x,data.speedLastPos.y,data.speedLastPos.z
-                                        local ddx,ddy,ddz = data.realPos.x-lx, data.realPos.y-ly, data.realPos.z-lz
-                                        data.speed = math_sqrt(ddx*ddx+ddy*ddy+ddz*ddz)/dt
-                                        if dist>0.01 then data.radialSpeed = (ddx*dx+ddy*dy+ddz*dz)/(dist*dt) else data.radialSpeed=0 end
-                                        if data.speed <= 0.1 then data.lastPainted = nil end
+                                    if dt > 0.1 then
+                                        local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
+                                        local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
+                                        data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                        if dist > 0.01 then
+                                            data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                        else
+                                            data.radialSpeed = 0
+                                        end
                                     end
                                 end
-                                data.speedLastPos = {x=data.realPos.x,y=data.realPos.y,z=data.realPos.z}
+                                data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
                                 data.speedLastTime = now
                                 data.speedLastCalc = now
                             end
@@ -833,7 +872,7 @@ local function passiveListenerLoop()
             end
             -- 清理过期目标
             for id, data in pairs(targets) do
-                if data.lastSeen and (now-data.lastSeen > TARGET_FADE_DURATION) then
+                if data.lastSeen and (now - data.lastSeen > TARGET_FADE_DURATION) then
                     targets[id] = nil
                     if id == selectedTargetId then selectedTargetId = nil end
                 end
@@ -849,9 +888,11 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v1.3 - OK")
+print("GHG Sonar v1.3.1 - OK")
 print("  Name : " .. myLabel)
 print("  Range: " .. PASSIVE_MAX_RANGE .. "m")
+print("  Sector: " .. LISTEN_SECTOR_WIDTH .. "deg, Hold: " .. LISTEN_HOLD_TIME .. "s")
+print("  Speeds shown even if zero.")
 sleep(1.0)
 
 parallel.waitForAll(
