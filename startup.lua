@@ -1,28 +1,23 @@
---[[ GHG 被动定向水听器 v1.8
-     速度过滤：扇区内停留 0.5 秒且快速速度 > 4 km/h 显示蓝线
-     锁定后：每 3 秒稳定测速，HUD 未完成时显示 ?km/h
-     GPU 标签显示相对/绝对方位 + 速度(km/h) + 接近符号
+--[[ GHG 被动定向水听器 v1.9
+     固定探测距离 5000 米，Camera 自动重连
+     速度平滑：5秒窗口，最小2秒时间差
+     速度过滤：扇区内停留 0.5s 且速度 > 4 km/h 显示
+     锁定后：每 3 秒稳定测速，未完成时显示 ?km/h
 --]]
 
 -- ==========================================
 --  全局配置
 -- ==========================================
-local PASSIVE_MAX_RANGE        = 5000.0
 local CHANNEL                  = 8888
 local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
 local LISTEN_SECTOR_WIDTH      = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_CALC_INTERVAL      = 3.0      -- 锁定目标测速间隔
-local QUICK_SPEED_INTERVAL     = 0.5      -- 快速检测间隔
+local SPEED_CALC_INTERVAL      = 3.0      -- 锁定目标测速间隔（秒）
+local QUICK_SPEED_INTERVAL     = 2.0      -- 普通目标快速检测间隔（秒）
 local LISTEN_HOLD_TIME         = 0.5      -- 停留 0.5 秒即检测
 local MIN_SPEED_KMH            = 4.0      -- 最小显示速度 (km/h)
-
--- 深度映射
-local SEA_LEVEL_Y    = -4        -- 请根据服务器实际海平面修改（通常 63）
-local RANGE_SURFACE  = 1000
-local RANGE_DEEP     = 5000
-local DEEP_Y         = -14
+local FIXED_RANGE              = 5000     -- 固定探测距离（米）
 
 -- ==========================================
 -- 外设初始化
@@ -43,12 +38,6 @@ if not camera then error("Error: Camera not found!", 0) end
 
 local cachedServo = peripheral.find("servo")
 local isServoConnected = false
-
-local HAS_FORCE_API = (camera.forcePitchYaw ~= nil)
-local function applyCameraAngle(p, y)
-    if HAS_FORCE_API then camera.forcePitchYaw(p, y)
-    else camera.setPitch(p); camera.setYaw(y) end
-end
 
 redstone.setOutput("front", false)
 
@@ -101,7 +90,6 @@ end
 local targets               = {}
 local localPos              = nil
 local selectedTargetId      = nil
-local selectedTargetDistStr = nil
 local currentQAbs, currentQLoc = nil, nil
 local currentServoAngle     = 0
 local yawOffset             = 0
@@ -114,7 +102,7 @@ local isEditing             = false
 local inputStr              = ""
 local iffMode               = "enemy"
 local currentNorthYawDeg    = 0
-local currentPassiveRange   = RANGE_SURFACE
+local currentPassiveRange   = FIXED_RANGE   -- 固定 5000
 
 -- ==========================================
 --  配置文件
@@ -228,7 +216,6 @@ for _, name in ipairs(peripheral.getNames()) do
             bw = math.max(1, bw), bh = math.max(1, bh),
             mode = monitorModes[name] or "STATUS",
             lastSText=nil, lastRText=nil, lastLText=nil, lastDText=nil,
-            lastIffMode=nil,
         })
         mIndex = mIndex + 1
     end
@@ -259,12 +246,11 @@ local function initGpuList()
             if r>=110 then dotSize=4 elseif r>=80 then dotSize=3 elseif r>=50 then dotSize=2 else dotSize=1 end
             if bw>=3 and bh>=3 then dotSize = dotSize+1 end
             dotSize = math_max(2, dotSize)
-            local entry = {
+            table.insert(sonarGpuList, {
                 gpu=g, name=name, w=w, h=h, cx=cx, cy=cy, r=r,
                 bw=bw, bh=bh, dotSize=dotSize,
-            }
-            table.insert(sonarGpuList, entry)
-            gpuNameMap[name] = entry
+            })
+            gpuNameMap[name] = {gpu=g, cx=cx, cy=cy, r=r, w=w, h=h, dotSize=dotSize}
         end
     end
 end
@@ -272,14 +258,14 @@ initGpuList()
 local isHeadless = (#hudMonitorList==0 and #sonarGpuList==0)
 
 -- ==========================================
--- 注册检查（保持不变，略）
+-- 注册检查（忽略授权距离，只取名称）
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1,1)
     term.setTextColor(colors.cyan)
-    print("GHG Sonar v1.8 - Registration Check")
+    print("GHG Sonar v1.9 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -304,6 +290,7 @@ local function checkRegistration()
                 if d.t==5 and d.ti==myId then
                     os.cancelTimer(timer)
                     myLabel = tostring(d.n or myLabel)
+                    -- 完全忽略授权距离，使用固定 5000
                     term.setTextColor(colors.lime)
                     print(string.format("Registered! Name: %s", myLabel))
                     sleep(0.8)
@@ -407,7 +394,7 @@ print("Registration OK. Starting GHG sonar...")
 sleep(0.5)
 
 -- ==========================================
--- GPU 绘制函数（包含速度有效性判断）
+-- GPU 绘制函数
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1-r
@@ -486,8 +473,7 @@ local function gpuDrawTargetLine(entry, yawRad, color, targetData)
         local relBearing = (targetData.paintedYaw + 360) % 360
         local absBearing = (relBearing + currentNorthYawDeg + yawOffset + 360) % 360
         local speedStr = "?km/h"
-        -- 如果有有效速度且最近一次测速未过期，显示速度
-        if targetData.speed and targetData.speedLastCalc and (os_clock() - targetData.speedLastCalc < SPEED_CALC_INTERVAL + 1.0) then
+        if targetData.speed and targetData.speedLastCalc and (os_clock() - targetData.speedLastCalc < SPEED_CALC_INTERVAL + 2.0) then
             speedStr = string.format("%.1fkm/h", targetData.speed * 3.6)
         end
         local radial = radialSymbol(targetData.radialSpeed)
@@ -535,7 +521,7 @@ local function sonarGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环（速度 km/h，未测速时显示 ?km/h）
+-- HUD 主循环
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList == 0 then return end
@@ -553,7 +539,7 @@ local function hudMonitorUI()
                     local absB = (relB + currentNorthYawDeg + yawOffset + 360) % 360
                     local distStr = string.format("%.0fm", sel.paintedDist or 0)
                     local spdStr = "?km/h"
-                    if sel.speed and sel.speedLastCalc and (os_clock() - sel.speedLastCalc < SPEED_CALC_INTERVAL + 1.0) then
+                    if sel.speed and sel.speedLastCalc and (os_clock() - sel.speedLastCalc < SPEED_CALC_INTERVAL + 2.0) then
                         spdStr = string.format("%.1fkm/h", sel.speed * 3.6)
                     end
                     local idStr = tostring(sel.name or "??")
@@ -582,7 +568,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI（略）
+-- 终端 UI
 -- ==========================================
 local function termUI()
     while true do
@@ -648,7 +634,7 @@ local function termUI()
             drawInputBox(6, "Motor Offset:", motorOffset, menuIndex==2, isEditing)
             term.setCursorPos(2,10); term.setTextColor(colors.yellow); term.write("=== SYSTEM STATUS ===")
             term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write(string.format("Registered: %s", myLabel))
-            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write(string.format("Max Range : %.0f m (dynamic)", currentPassiveRange))
+            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write(string.format("Max Range : %d m (fixed)", FIXED_RANGE))
             term.setCursorPos(2,16)
             if isServoConnected then term.setTextColor(colors.white); term.write(string.format("Listen Dir: %6.1f deg", currentServoAngle))
             else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
@@ -719,10 +705,6 @@ local function listenLoop()
         if ch==CHANNEL and type(msg)=="table" and msg.v==2 and msg.t==1 and msg.i~=myId then
             if not targets[msg.i] then targets[msg.i] = {name=msg.n} end
             local t = targets[msg.i]
-            if t.realPos then
-                t.speedLastPos = {x=t.realPos.x, y=t.realPos.y, z=t.realPos.z}
-                t.speedLastTime = os_clock()
-            end
             t.realPos = {x=msg.x, y=msg.y, z=msg.z}
             t.modemDist = dist
             t.realDist = calcRangingDist(localPos, t.realPos) or dist
@@ -747,7 +729,7 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 被动监听主循环（快速检测 + 锁定稳定测速）
+-- 被动监听主循环（Camera 重连、固定范围、速度平滑）
 -- ==========================================
 local function passiveListenerLoop()
     local pollTick = 0
@@ -755,12 +737,25 @@ local function passiveListenerLoop()
     while true do
         if currentScreenTab==2 then sleep(0.5)
         else
+            -- 外设轮询
             if pollTick<=0 then
                 pollTick = 20
                 if not cachedServo then cachedServo = peripheral.find("servo") end
+                -- Camera 丢失重连
+                if not camera then
+                    for _, name in ipairs(peripheral.getNames()) do
+                        if peripheral.getType(name) == "camera" then
+                            camera     = peripheral.wrap(name)
+                            cameraName = name
+                            break
+                        end
+                    end
+                end
             else
                 pollTick = pollTick-1
             end
+
+            -- 舵机角度
             if cachedServo then
                 local ok, ang = pcall(cachedServo.getAngle)
                 if ok and type(ang)=="number" then
@@ -774,15 +769,12 @@ local function passiveListenerLoop()
                 isServoConnected = false
             end
 
+            -- 获取相机位置
             local ok, pos = pcall(camera.getCameraPosition)
             if ok then localPos = pos else localPos = nil end
 
-            -- 动态范围
-            if localPos then
-                local depth = math_max(0, (SEA_LEVEL_Y - localPos.y))
-                currentPassiveRange = math_min(RANGE_DEEP, math_max(RANGE_SURFACE,
-                    RANGE_SURFACE + 400 * depth))
-            end
+            -- 固定探测距离
+            currentPassiveRange = FIXED_RANGE
 
             -- 计算船头朝向
             if not isHeadless then
@@ -808,25 +800,33 @@ local function passiveListenerLoop()
                         local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
                         data.realDist = dist
 
-                        -- 速度更新：锁定目标 3 秒间隔，普通目标快速间隔
+                        -- 速度平滑：5秒滑动窗口
+                        if not data.posHistory then
+                            data.posHistory = {}
+                        end
+                        table.insert(data.posHistory, {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z, t=now})
+                        while #data.posHistory > 0 and now - data.posHistory[1].t > 5.0 do
+                            table.remove(data.posHistory, 1)
+                        end
+
                         local interval = (id == selectedTargetId) and SPEED_CALC_INTERVAL or QUICK_SPEED_INTERVAL
                         if not data.speedLastCalc or (now - data.speedLastCalc >= interval) then
-                            if data.speedLastPos and data.speedLastTime then
-                                local dt = now - data.speedLastTime
-                                if dt > 0.1 then
-                                    local lx,ly,lz = data.speedLastPos.x, data.speedLastPos.y, data.speedLastPos.z
-                                    local ddx,ddy,ddz = data.realPos.x - lx, data.realPos.y - ly, data.realPos.z - lz
-                                    data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
-                                    if dist > 0.01 then
-                                        data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
-                                    else
-                                        data.radialSpeed = 0
-                                    end
+                            local oldest = data.posHistory[1]
+                            local newest = data.posHistory[#data.posHistory]
+                            if oldest and newest and (newest.t - oldest.t) >= 2.0 then
+                                local dt = newest.t - oldest.t
+                                local ddx = newest.x - oldest.x
+                                local ddy = newest.y - oldest.y
+                                local ddz = newest.z - oldest.z
+                                data.speed = math_sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / dt
+                                if dist > 0.01 then
+                                    data.radialSpeed = (ddx*dx + ddy*dy + ddz*dz) / (dist*dt)
+                                else
+                                    data.radialSpeed = 0
                                 end
+                                data.speedLastCalc = now
+                                data.posHistory = {}  -- 清空窗口，重新累积
                             end
-                            data.speedLastCalc = now
-                            data.speedLastPos = {x=data.realPos.x, y=data.realPos.y, z=data.realPos.z}
-                            data.speedLastTime = now
                         end
 
                         -- 距离过滤
@@ -846,10 +846,8 @@ local function passiveListenerLoop()
                             data.paintedDist = dist
 
                             if id == selectedTargetId then
-                                -- 锁定目标始终显示红线
                                 data.lastPainted = now
                             else
-                                -- 普通目标：扇区判断 + 停留计时 + 速度过滤
                                 local inSector = true
                                 if isServoConnected then
                                     inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= LISTEN_SECTOR_WIDTH/2
@@ -893,11 +891,10 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v1.8 - OK")
+print("GHG Sonar v1.9 - OK")
 print("  Name : " .. myLabel)
-print("  Dynamic Range (y="..SEA_LEVEL_Y..":"..RANGE_SURFACE.."m, y="..DEEP_Y..":"..RANGE_DEEP.."m)")
+print("  Fixed Range: " .. FIXED_RANGE .. "m")
 print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h")
-print("  Locked target speed update: " .. SPEED_CALC_INTERVAL .. "s")
 sleep(1.0)
 
 parallel.waitForAll(
