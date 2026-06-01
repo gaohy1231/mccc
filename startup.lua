@@ -712,7 +712,6 @@ local function listenLoop()
             t.modemDist = dist
             t.realDist = calcRangingDist(localPos, t.realPos) or dist
             t.lastSeen = os_clock()
-            t.sectorEnterTime = nil
         end
     end
 end
