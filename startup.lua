@@ -69,7 +69,7 @@ local os_clock   = os.clock
 local os_pullEvent = os.pullEvent
 
 -- ==========================================
--- 颜色工具（使用雷达原始十六进制写法）
+-- 颜色工具（雷达原版写法）
 -- ==========================================
 local function colorUnpack(c)
     return math_floor(c / 0x10000) % 0x100,
@@ -207,6 +207,12 @@ local C = {
     WHITE       = 0xFFFFFF,
     UNREG_FG    = 0xFF2200,
     UNREG_BG    = 0x1A0000,
+    ALLY_HOT    = 0x44FFAA,   -- 确保存在
+    FOE_HOT     = 0xFF3300,
+    UNK_HOT     = 0x66FF66,
+    BEACON_ALLY = 0x44FF44,
+    BEACON_UNK  = 0xFFFF44,
+    RWR_HOT     = 0xFFCC00,
 }
 
 -- ==========================================
