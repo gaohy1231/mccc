@@ -9,13 +9,13 @@
 local CHANNEL                  = 8888
 local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
-local SCAN_SECTOR_WIDTH        = 30.0   -- 监听线扇区宽度（仅用于显示监听线）
+local SCAN_SECTOR_WIDTH        = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_INTERVAL           = 3.0    -- 测速间隔
-local MIN_SPEED_KMH            = 4.0    -- 速度过滤阈值
-local HEARTBEAT_INTERVAL       = 5.0    -- 心跳间隔
+local SPEED_INTERVAL           = 3.0
+local MIN_SPEED_KMH            = 4.0
+local HEARTBEAT_INTERVAL       = 5.0
 
--- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，F3 查看)
+-- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，通常为 63 或 62)
 local SEA_LEVEL_Y    = -4
 local RANGE_SURFACE  = 1000
 local RANGE_DEEP     = 5000
@@ -69,15 +69,15 @@ local os_clock   = os.clock
 local os_pullEvent = os.pullEvent
 
 -- ==========================================
--- 颜色工具
+-- 颜色工具（使用雷达原始十六进制写法）
 -- ==========================================
 local function colorUnpack(c)
-    return math_floor(c / 65536) % 256,
-           math_floor(c / 256)   % 256,
-           c % 256
+    return math_floor(c / 0x10000) % 0x100,
+           math_floor(c / 0x100)   % 0x100,
+           c % 0x100
 end
 local function colorPack(r, g, b)
-    return math_floor(r) * 65536 + math_floor(g) * 256 + math_floor(b)
+    return math_floor(r) * 0x10000 + math_floor(g) * 0x100 + math_floor(b)
 end
 local function colorLerp(ca, cb, t)
     t = math_max(0.0, math_min(1.0, t))
@@ -105,8 +105,8 @@ local yawOffset             = 0
 local motorOffset           = 0
 local myLabel               = os.getComputerLabel() or ("Hydro-" .. myId)
 local monitorModes          = {}
-local aimPrecision          = 5     -- 瞄准精度（保留）
-local currentRadarRange     = 0     -- 实际水听范围
+local aimPrecision          = 5
+local currentRadarRange     = 0
 local currentNorthYawDeg    = 0
 local currentScreenTab      = 1
 local menuIndex             = 1
@@ -479,7 +479,7 @@ local function gpuRefreshSonar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- GPU 主循环 (正常过滤)
+-- GPU 主循环
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
@@ -501,7 +501,7 @@ local function rdrGpuUI()
             lastActive=isActive; lastIff=iffMode
             targetPoolCount=0
             local now=os_clock()
-            if cachedLocalPos and isActive then   -- 使用缓存的位置
+            if cachedLocalPos and isActive then
                 for _,data in pairs(targets) do
                     if data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
                         local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
@@ -626,7 +626,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件（线段点选锁定/取消，保留 aimPrecision 编辑）
+-- 输入事件
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -690,7 +690,7 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 心跳循环（发送无害 t=1，坐标0）
+-- 心跳循环
 -- ==========================================
 local function heartbeatLoop()
     while true do
@@ -765,9 +765,9 @@ local function cameraLoop()
                 local ok,pos=pcall(camera.getCameraPosition)
                 if ok and pos then
                     localPos = pos
-                    cachedLocalPos = pos   -- 更新缓存
+                    cachedLocalPos = pos
                 elseif cachedLocalPos then
-                    localPos = cachedLocalPos  -- 使用缓存
+                    localPos = cachedLocalPos
                 else
                     localPos = nil
                 end
@@ -790,7 +790,6 @@ local function cameraLoop()
 
                     local now=os_clock()
                     if localPos then
-                        -- 更新所有目标方位与距离
                         for id,data in pairs(targets) do
                             if data.realPos then
                                 local dx = data.realPos.x - localPos.x
@@ -811,7 +810,6 @@ local function cameraLoop()
                                 data.paintedYaw = tYaw
                                 data.paintedDist = dist
 
-                                -- 显示条件：距离范围内，速度 > 阈值（未知速度允许显示）
                                 if id == selectedTargetId then
                                     data.lastPainted = now
                                 else
@@ -823,7 +821,7 @@ local function cameraLoop()
                             end
                         end
 
-                        -- 目标锁定与摄像头跟踪（类似雷达）
+                        -- 目标锁定与摄像头跟踪
                         local bestTarget = nil
                         if selectedTargetId and targets[selectedTargetId] then
                             local sel = targets[selectedTargetId]
@@ -834,31 +832,26 @@ local function cameraLoop()
                             end
                         end
                         if bestTarget then
-                            if bestTarget.isBeingScanned then   -- 此字段未使用，忽略
-                                -- 计算摄像头角度并应用
-                                local tPitch, tYaw = 0, 0
-                                if currentQAbs and currentQLoc then
-                                    local iqx,iqy,iqz,iqw=quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
-                                    local dx=bestTarget.realPos.x-localPos.x
-                                    local dy=bestTarget.realPos.y-localPos.y
-                                    local dz=bestTarget.realPos.z-localPos.z
-                                    local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
-                                    local sx,sy,sz=rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                                    tYaw=math_deg(math_atan2(-sx,sz))
-                                    tPitch=math_deg(math_atan2(-sy, math_sqrt(sx*sx+sz*sz)))
-                                else
-                                    tPitch,tYaw=calculateLookAngles(localPos.x,localPos.y,localPos.z,
-                                        bestTarget.realPos.x,bestTarget.realPos.y,bestTarget.realPos.z)
-                                end
-                                local normYaw = tYaw % 360
-                                local gridIdx = math_floor(normYaw / aimPrecision)
-                                local snappedYaw = gridIdx * aimPrecision + (aimPrecision/2)
-                                if snappedYaw > 180 then snappedYaw = snappedYaw - 360 end
-                                holdPitch, holdYaw = tPitch, snappedYaw
-                                pcall(applyCameraAngle, tPitch, snappedYaw)
-                            elseif holdPitch and holdYaw then
-                                pcall(applyCameraAngle, holdPitch, holdYaw)
+                            local tPitch, tYaw = 0, 0
+                            if currentQAbs and currentQLoc then
+                                local iqx,iqy,iqz,iqw=quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                                local dx=bestTarget.realPos.x-localPos.x
+                                local dy=bestTarget.realPos.y-localPos.y
+                                local dz=bestTarget.realPos.z-localPos.z
+                                local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                                local sx,sy,sz=rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                                tYaw=math_deg(math_atan2(-sx,sz))
+                                tPitch=math_deg(math_atan2(-sy, math_sqrt(sx*sx+sz*sz)))
+                            else
+                                tPitch,tYaw=calculateLookAngles(localPos.x,localPos.y,localPos.z,
+                                    bestTarget.realPos.x,bestTarget.realPos.y,bestTarget.realPos.z)
                             end
+                            local normYaw = tYaw % 360
+                            local gridIdx = math_floor(normYaw / aimPrecision)
+                            local snappedYaw = gridIdx * aimPrecision + (aimPrecision/2)
+                            if snappedYaw > 180 then snappedYaw = snappedYaw - 360 end
+                            holdPitch, holdYaw = tPitch, snappedYaw
+                            pcall(applyCameraAngle, tPitch, snappedYaw)
                         else
                             if holdPitch and holdYaw then
                                 pcall(applyCameraAngle, holdPitch, holdYaw)
