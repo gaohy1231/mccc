@@ -1,6 +1,6 @@
---[[ GHG 被动定向水听器 v3.4 完整诊断版
-     强制显示所有目标，打印目标池信息
-     完整无省略，包含注册、未注册界面、心跳、完整 UI 等。
+--[[ GHG 被动定向水听器 v4.0
+     恢复雷达探测原理：舵机 + 摄像头锁定目标
+     被动接收，心跳维持在线，动态范围，速度过滤，方位线
 --]]
 
 -- ==========================================
@@ -9,13 +9,13 @@
 local CHANNEL                  = 8888
 local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
-local SCAN_SECTOR_WIDTH        = 30.0
+local SCAN_SECTOR_WIDTH        = 30.0   -- 监听线扇区宽度（仅用于显示监听线）
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_INTERVAL           = 3.0
-local MIN_SPEED_KMH            = 4.0
-local HEARTBEAT_INTERVAL       = 5.0
+local SPEED_INTERVAL           = 3.0    -- 测速间隔
+local MIN_SPEED_KMH            = 4.0    -- 速度过滤阈值
+local HEARTBEAT_INTERVAL       = 5.0    -- 心跳间隔
 
--- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，通常为 63 或 62)
+-- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，F3 查看)
 local SEA_LEVEL_Y    = -4
 local RANGE_SURFACE  = 1000
 local RANGE_DEEP     = 5000
@@ -37,6 +37,12 @@ for _, name in ipairs(peripheral.getNames()) do
     end
 end
 if not camera then error("Camera not found!", 0) end
+
+local HAS_FORCE_API = (camera.forcePitchYaw ~= nil)
+local function applyCameraAngle(p, y)
+    if HAS_FORCE_API then camera.forcePitchYaw(p, y)
+    else camera.setPitch(p); camera.setYaw(y) end
+end
 
 local cachedServo = peripheral.find("servo")
 local isServoConnected = false
@@ -91,6 +97,7 @@ end
 -- ==========================================
 local targets               = {}
 local localPos              = nil
+local cachedLocalPos        = nil   -- 位置缓存
 local selectedTargetId      = nil
 local currentQAbs, currentQLoc = nil, nil
 local currentServoAngle     = 0
@@ -98,8 +105,8 @@ local yawOffset             = 0
 local motorOffset           = 0
 local myLabel               = os.getComputerLabel() or ("Hydro-" .. myId)
 local monitorModes          = {}
-local aimPrecision          = 5
-local currentRadarRange     = 0
+local aimPrecision          = 5     -- 瞄准精度（保留）
+local currentRadarRange     = 0     -- 实际水听范围
 local currentNorthYawDeg    = 0
 local currentScreenTab      = 1
 local menuIndex             = 1
@@ -121,6 +128,12 @@ local function loadConfig()
         if type(data) == "table" then
             if data.yawOffset   then yawOffset   = tonumber(data.yawOffset)   or 0 end
             if data.motorOffset then motorOffset = tonumber(data.motorOffset) or 0 end
+            if data.aimPrecision then
+                local p = tonumber(data.aimPrecision)
+                if p and p >= 1 and p <= 90 and (360 % math_floor(p) == 0) then
+                    aimPrecision = math_floor(p)
+                end
+            end
             if type(data.monitorModes) == "table" then
                 monitorModes = data.monitorModes
             end
@@ -132,6 +145,7 @@ local function saveConfig()
     f.write(textutils.serialize({
         yawOffset    = yawOffset,
         motorOffset  = motorOffset,
+        aimPrecision = aimPrecision,
         monitorModes = monitorModes,
     }))
     f.close()
@@ -257,7 +271,7 @@ local isHeadless = (#hudMonitorList==0 and #rdrGpuList==0)
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1,1)
-    term.setTextColor(colors.cyan); print("GHG Sonar v3.4 (debug) - Registration")
+    term.setTextColor(colors.cyan); print("GHG Sonar v4.0 - Registration")
     term.setTextColor(colors.white); print("My ID: " .. myId); print("Querying scanner...")
 
     for _, entry in ipairs(rdrGpuList) do
@@ -294,9 +308,6 @@ local function checkRegistration()
     end
 end
 
--- ==========================================
--- 未注册显示（完整）
--- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
         pcall(function()
@@ -366,9 +377,6 @@ local function showNotRegisteredAndHalt()
     while true do sleep(60) end
 end
 
--- ==========================================
--- 执行注册校验
--- ==========================================
 local isRegistered = checkRegistration()
 if not isRegistered then
     showNotRegisteredAndHalt()
@@ -376,7 +384,7 @@ if not isRegistered then
 end
 
 term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1,1)
-term.setTextColor(colors.green); print("Registration OK. Starting debug sonar...")
+term.setTextColor(colors.green); print("Registration OK. Starting sonar...")
 speedTimer = os.startTimer(SPEED_INTERVAL)
 sleep(0.5)
 
@@ -471,7 +479,7 @@ local function gpuRefreshSonar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- GPU 主循环 (强制所有目标入池，含调试日志)
+-- GPU 主循环 (正常过滤)
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
@@ -493,29 +501,28 @@ local function rdrGpuUI()
             lastActive=isActive; lastIff=iffMode
             targetPoolCount=0
             local now=os_clock()
-            if localPos and isActive then
-                for id, data in pairs(targets) do
-                    -- 强制加入池：只要有方位数据（paintedYaw）就画线
-                    if data.paintedYaw then
-                        targetPoolCount = targetPoolCount + 1
-                        local t = targetPool[targetPoolCount]
-                        if not t then t = {}; targetPool[targetPoolCount] = t end
-                        t.rad = math_rad(data.paintedYaw + yawOffset)
-                        if id == selectedTargetId then
-                            t.color = C.LOCKED_LINE
-                        else
+            if cachedLocalPos and isActive then   -- 使用缓存的位置
+                for _,data in pairs(targets) do
+                    if data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
+                        local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
+                        if col then
+                            targetPoolCount = targetPoolCount + 1
+                            local t = targetPool[targetPoolCount]
+                            if not t then t = {}; targetPool[targetPoolCount] = t end
+                            t.rad = math_rad(data.paintedYaw + yawOffset)
                             t.color = C.TARGET_LINE
+                            t.data = data
                         end
-                        t.data = data
-                        -- 调试打印
-                        print(string.format("Pool + %s dist=%.0f yaw=%.1f",
-                            data.name or id, data.paintedDist or 0, data.paintedYaw))
                     end
                 end
-                if targetPoolCount == 0 then
-                    print("Pool empty, no targets with paintedYaw")
-                else
-                    print("Total pool count: " .. targetPoolCount)
+                if selectedTargetId and targets[selectedTargetId] and targets[selectedTargetId].paintedYaw then
+                    local data = targets[selectedTargetId]
+                    targetPoolCount = targetPoolCount + 1
+                    local t = targetPool[targetPoolCount]
+                    if not t then t = {}; targetPool[targetPoolCount] = t end
+                    t.rad = math_rad(data.paintedYaw + yawOffset)
+                    t.color = C.LOCKED_LINE
+                    t.data = data
                 end
             end
             for _,entry in ipairs(rdrGpuList) do
@@ -543,7 +550,7 @@ local function hudMonitorUI()
                     sText="OFFLINE"; sColor=colors.red; rText="---"; rColor=colors.gray
                     lText="---"; lColor=colors.gray; dText="---"; dColor=colors.gray
                 else
-                    sText="DEBUG"; sColor=colors.green
+                    sText="PASSIVE"; sColor=colors.green
                     rText=string.format("%dm", math_floor(currentRadarRange)); rColor=colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel=targets[selectedTargetId]
@@ -578,34 +585,57 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI（简化的调试界面）
+-- 终端 UI
 -- ==========================================
 local function termUI()
     while true do
         term.setBackgroundColor(colors.black); term.clear()
-        term.setCursorPos(1,1); term.setTextColor(colors.yellow)
-        term.write("=== SONAR DEBUG v3.4 ===")
-        term.setCursorPos(1,3); term.setTextColor(colors.white)
-        term.write("Range: " .. math_floor(currentRadarRange) .. "m")
-        term.setCursorPos(1,4)
-        local count = 0
-        for _ in pairs(targets) do count = count + 1 end
-        term.write("Targets in memory: " .. count)
-        term.setCursorPos(1,5)
-        term.write("Pool count: " .. targetPoolCount)
-        term.setCursorPos(1,7)
-        term.write("Heard messages are printed below")
-        sleep(0.5)
+        if currentScreenTab==2 then
+            term.setCursorPos(2,2); term.setTextColor(colors.lightGray); term.write("=== CONNECTED DISPLAYS ===")
+            local r=4
+            term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[TOM'S GPU - SONAR]"); r=r+1
+            if #rdrGpuList==0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No tm_gpu"); r=r+1
+            else for _,e in ipairs(rdrGpuList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..e.name); r=r+1 end end
+            r=r+1; term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[CC MONITOR - HUD]"); r=r+1
+            if #hudMonitorList==0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No monitors"); r=r+1
+            else for _,info in ipairs(hudMonitorList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..info.displayName); r=r+1 end end
+            r=r+1; term.setCursorPos(2,r); term.setTextColor(colors.lightGray); term.write("Camera: "..cameraName.."  [ONLINE]")
+            r=r+2; term.setCursorPos(2,r); term.setTextColor(colors.yellow); term.write("Press [TAB] to Resume")
+        else
+            term.setCursorPos(2,2); term.setTextColor(colors.yellow); term.write("=== SONAR CONFIG ===")
+            local function drawInputBox(y,label,val,sel,edit)
+                term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
+                term.setTextColor(sel and colors.yellow or colors.lightGray); term.write(label)
+                term.setCursorPos(15,y); term.setBackgroundColor(colors.gray)
+                local txt = (sel and edit) and (inputStr.."_") or tostring(val)
+                term.setTextColor(sel and colors.white or colors.lightGray)
+                term.write(string.format(" %-12s ", txt)); term.setBackgroundColor(colors.black)
+            end
+            drawInputBox(4, "Hydro Offset:", yawOffset, menuIndex==1, isEditing)
+            drawInputBox(6, "Motor Offset:", motorOffset, menuIndex==2, isEditing)
+            drawInputBox(8, "Aim Precis  :", aimPrecision, menuIndex==3, isEditing)
+            term.setCursorPos(2,10); term.setTextColor(colors.yellow); term.write("=== SYSTEM STATUS ===")
+            term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write("Registered: "..myLabel)
+            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write("Max Range: "..math_floor(currentRadarRange).." m (dynamic)")
+            term.setCursorPos(2,16); if isServoConnected then term.setTextColor(colors.white); term.write("Listen Dir: "..string.format("%.1f", currentServoAngle).." deg") else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
+            term.setCursorPos(2,18); if iffMode=="friendly" then term.setTextColor(colors.lightBlue); term.write("IFF: ALLY") else term.setTextColor(colors.red); term.write("IFF: FOE") end
+            term.setCursorPos(2,19); term.setTextColor(colors.gray); term.write("[TAB] Monitor  [Back RS] IFF")
+        end
+        sleep(0.2)
     end
 end
 
 -- ==========================================
--- 输入事件（保留触摸锁定）
+-- 输入事件（线段点选锁定/取消，保留 aimPrecision 编辑）
 -- ==========================================
 local function inputLoop()
     local function applySave()
         if menuIndex==1 then yawOffset = tonumber(inputStr) or yawOffset
-        elseif menuIndex==2 then motorOffset = tonumber(inputStr) or motorOffset end
+        elseif menuIndex==2 then motorOffset = tonumber(inputStr) or motorOffset
+        elseif menuIndex==3 then
+            local p = tonumber(inputStr)
+            if p and p >= 1 and p <= 90 and (360 % p == 0) then aimPrecision = math_floor(p) end
+        end
         saveConfig(); isEditing = false
     end
     while true do
@@ -617,15 +647,21 @@ local function inputLoop()
                 elseif p1==keys.backspace then inputStr = inputStr:sub(1,-2) end
             elseif currentScreenTab==1 then
                 if p1==keys.up then menuIndex = math_max(1, menuIndex-1)
-                elseif p1==keys.down then menuIndex = math_min(2, menuIndex+1)
+                elseif p1==keys.down then menuIndex = math_min(3, menuIndex+1)
                 elseif p1==keys.enter or p1==keys.numPadEnter then
                     isEditing = true
-                    inputStr = tostring(menuIndex==1 and yawOffset or motorOffset)
+                    if     menuIndex==1 then inputStr=tostring(yawOffset)
+                    elseif menuIndex==2 then inputStr=tostring(motorOffset)
+                    elseif menuIndex==3 then inputStr=tostring(aimPrecision) end
                 end
             end
         elseif event=="char" and isEditing then
-            if (p1>='0' and p1<='9') or p1=='.' or (p1=='-' and #inputStr==0) then
-                if #inputStr<8 then inputStr = inputStr..p1 end
+            if menuIndex==1 or menuIndex==2 then
+                if (p1>='0' and p1<='9') or p1=='.' or (p1=='-' and #inputStr==0) then
+                    if #inputStr<8 then inputStr = inputStr..p1 end
+                end
+            elseif menuIndex==3 then
+                if p1>='0' and p1<='9' and #inputStr<2 then inputStr = inputStr..p1 end
             end
         elseif (event=="tm_monitor_touch" or event=="tm_monitor_mouse_click") and currentScreenTab==1 then
             local entry = gpuNameMap[p1]
@@ -669,7 +705,7 @@ local function heartbeatLoop()
 end
 
 -- ==========================================
--- 网络监听（只收 t=1，含日志）
+-- 网络（只收 t=1）
 -- ==========================================
 local function listenLoop()
     while true do
@@ -679,15 +715,14 @@ local function listenLoop()
             local t = targets[msg.i]
             t.realPos = {x=msg.x, y=msg.y, z=msg.z}
             t.modemDist = dist
-            t.realDist = calcRangingDist(localPos, t.realPos) or dist
+            t.realDist = calcRangingDist(cachedLocalPos, t.realPos) or dist
             t.lastSeen = os_clock()
-            print("Heard " .. msg.n .. " dist=" .. dist)
         end
     end
 end
 
 -- ==========================================
--- IFF 切换（后部红石）
+-- IFF 切换
 -- ==========================================
 local function iffToggleLoop()
     local lastBack = redstone.getInput("back")
@@ -700,10 +735,11 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 主逻辑循环（强制更新方位，无条件显示所有目标）
+-- 主逻辑循环（恢复雷达锁定跟踪，位置缓存，动态范围，速度过滤）
 -- ==========================================
 local function cameraLoop()
     local lastServoAngle=nil; local peripheralPollTick=0
+    local holdPitch, holdYaw = nil, nil
     while true do
         if currentScreenTab==2 then sleep(0.5)
         else
@@ -727,7 +763,14 @@ local function cameraLoop()
 
             if camera then
                 local ok,pos=pcall(camera.getCameraPosition)
-                if ok and pos then localPos=pos else localPos=nil end
+                if ok and pos then
+                    localPos = pos
+                    cachedLocalPos = pos   -- 更新缓存
+                elseif cachedLocalPos then
+                    localPos = cachedLocalPos  -- 使用缓存
+                else
+                    localPos = nil
+                end
                 if localPos then
                     local depth = math_max(0, (SEA_LEVEL_Y - localPos.y))
                     currentRadarRange = math_min(RANGE_DEEP, math_max(RANGE_SURFACE,
@@ -746,32 +789,84 @@ local function cameraLoop()
                     end
 
                     local now=os_clock()
-                    for id,data in pairs(targets) do
-                        if data.realPos then
-                            local dx = data.realPos.x - localPos.x
-                            local dy = data.realPos.y - localPos.y
-                            local dz = data.realPos.z - localPos.z
-                            local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
-                            data.realDist = dist
+                    if localPos then
+                        -- 更新所有目标方位与距离
+                        for id,data in pairs(targets) do
+                            if data.realPos then
+                                local dx = data.realPos.x - localPos.x
+                                local dy = data.realPos.y - localPos.y
+                                local dz = data.realPos.z - localPos.z
+                                local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
+                                data.realDist = dist
 
-                            local tYaw
-                            if currentQAbs and currentQLoc then
-                                local iqx,iqy,iqz,iqw=quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
-                                local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
-                                local sx,sy,sz=rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                                tYaw=math_deg(math_atan2(-sx,sz))
-                            else
-                                _,tYaw=calculateLookAngles(localPos.x,localPos.y,localPos.z,data.realPos.x,data.realPos.y,data.realPos.z)
+                                local tYaw
+                                if currentQAbs and currentQLoc then
+                                    local iqx,iqy,iqz,iqw=quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                                    local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                                    local sx,sy,sz=rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                                    tYaw=math_deg(math_atan2(-sx,sz))
+                                else
+                                    _,tYaw=calculateLookAngles(localPos.x,localPos.y,localPos.z,data.realPos.x,data.realPos.y,data.realPos.z)
+                                end
+                                data.paintedYaw = tYaw
+                                data.paintedDist = dist
+
+                                -- 显示条件：距离范围内，速度 > 阈值（未知速度允许显示）
+                                if id == selectedTargetId then
+                                    data.lastPainted = now
+                                else
+                                    local speedOK = (data.speed == nil) or (data.speed > MIN_SPEED_KMH / 3.6)
+                                    if dist <= currentRadarRange and speedOK then
+                                        data.lastPainted = now
+                                    end
+                                end
                             end
-                            data.paintedYaw = tYaw
-                            data.paintedDist = dist
+                        end
 
-                            -- 强制显示：所有目标无条件标记为可见
-                            data.lastPainted = now
+                        -- 目标锁定与摄像头跟踪（类似雷达）
+                        local bestTarget = nil
+                        if selectedTargetId and targets[selectedTargetId] then
+                            local sel = targets[selectedTargetId]
+                            if sel.realDist and sel.realDist <= currentRadarRange then
+                                bestTarget = sel
+                            else
+                                selectedTargetId = nil
+                            end
+                        end
+                        if bestTarget then
+                            if bestTarget.isBeingScanned then   -- 此字段未使用，忽略
+                                -- 计算摄像头角度并应用
+                                local tPitch, tYaw = 0, 0
+                                if currentQAbs and currentQLoc then
+                                    local iqx,iqy,iqz,iqw=quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                                    local dx=bestTarget.realPos.x-localPos.x
+                                    local dy=bestTarget.realPos.y-localPos.y
+                                    local dz=bestTarget.realPos.z-localPos.z
+                                    local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                                    local sx,sy,sz=rotateVectorFast(hx,hy,hz,currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                                    tYaw=math_deg(math_atan2(-sx,sz))
+                                    tPitch=math_deg(math_atan2(-sy, math_sqrt(sx*sx+sz*sz)))
+                                else
+                                    tPitch,tYaw=calculateLookAngles(localPos.x,localPos.y,localPos.z,
+                                        bestTarget.realPos.x,bestTarget.realPos.y,bestTarget.realPos.z)
+                                end
+                                local normYaw = tYaw % 360
+                                local gridIdx = math_floor(normYaw / aimPrecision)
+                                local snappedYaw = gridIdx * aimPrecision + (aimPrecision/2)
+                                if snappedYaw > 180 then snappedYaw = snappedYaw - 360 end
+                                holdPitch, holdYaw = tPitch, snappedYaw
+                                pcall(applyCameraAngle, tPitch, snappedYaw)
+                            elseif holdPitch and holdYaw then
+                                pcall(applyCameraAngle, holdPitch, holdYaw)
+                            end
+                        else
+                            if holdPitch and holdYaw then
+                                pcall(applyCameraAngle, holdPitch, holdYaw)
+                            end
                         end
                     end
 
-                    -- 清理过期目标
+                    -- 清理超时目标
                     for id,data in pairs(targets) do
                         if data.lastSeen and (now-data.lastSeen > 10.0) then
                             targets[id]=nil
@@ -802,9 +897,9 @@ local function speedTimerLoop()
                         local dz = data.realPos.z - data.lastPos.z
                         data.speed = math_sqrt(dx*dx + dy*dy + dz*dz) / dt
                         if data.realDist and data.realDist > 0.01 then
-                            local relX = data.realPos.x - localPos.x
-                            local relY = data.realPos.y - localPos.y
-                            local relZ = data.realPos.z - localPos.z
+                            local relX = data.realPos.x - cachedLocalPos.x
+                            local relY = data.realPos.y - cachedLocalPos.y
+                            local relZ = data.realPos.z - cachedLocalPos.z
                             data.radialSpeed = (dx*relX + dy*relY + dz*relZ) / (data.realDist * dt)
                         else
                             data.radialSpeed = 0
@@ -825,10 +920,11 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v3.4 (Debug) - Showing all targets")
+print("GHG Sonar v4.0 - Passive with Radar Lock")
 print("  Name : " .. myLabel)
 print("  Dynamic Range (y="..SEA_LEVEL_Y..": "..RANGE_SURFACE.."m, y="..DEEP_Y..": "..RANGE_DEEP.."m)")
-print("  Speed filter disabled for testing")
+print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h")
+print("  Camera lock: aim precision " .. aimPrecision .. " deg")
 sleep(1.0)
 
 parallel.waitForAll(
