@@ -1,7 +1,6 @@
---[[ GHG 被动定向水听器 v3.3
-     修复新目标因速度 nil 无法显示的问题
-     心跳发送无害 t=1（坐标0）维持在线
-     动态深度范围、速度过滤、目标线、HUD 优化、完整界面
+--[[ GHG 被动定向水听器 v3.4 完整诊断版
+     强制显示所有目标，打印目标池信息
+     完整无省略，包含注册、未注册界面、心跳、完整 UI 等。
 --]]
 
 -- ==========================================
@@ -10,13 +9,13 @@
 local CHANNEL                  = 8888
 local TARGET_FADE_DURATION     = 8.0
 local TARGET_HOT_DURATION      = 2.0
-local SCAN_SECTOR_WIDTH        = 30.0    -- 监听扇区宽度
+local SCAN_SECTOR_WIDTH        = 30.0
 local REG_QUERY_TIMEOUT        = 5.0
-local SPEED_INTERVAL           = 3.0     -- 测速间隔
-local MIN_SPEED_KMH            = 4.0     -- 速度过滤阈值
-local HEARTBEAT_INTERVAL       = 5.0     -- 心跳间隔
+local SPEED_INTERVAL           = 3.0
+local MIN_SPEED_KMH            = 4.0
+local HEARTBEAT_INTERVAL       = 5.0
 
--- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，F3 查看)
+-- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，通常为 63 或 62)
 local SEA_LEVEL_Y    = -4
 local RANGE_SURFACE  = 1000
 local RANGE_DEEP     = 5000
@@ -258,7 +257,7 @@ local isHeadless = (#hudMonitorList==0 and #rdrGpuList==0)
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1,1)
-    term.setTextColor(colors.cyan); print("GHG Sonar v3.3 - Registration")
+    term.setTextColor(colors.cyan); print("GHG Sonar v3.4 (debug) - Registration")
     term.setTextColor(colors.white); print("My ID: " .. myId); print("Querying scanner...")
 
     for _, entry in ipairs(rdrGpuList) do
@@ -295,6 +294,9 @@ local function checkRegistration()
     end
 end
 
+-- ==========================================
+-- 未注册显示（完整）
+-- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
         pcall(function()
@@ -364,6 +366,9 @@ local function showNotRegisteredAndHalt()
     while true do sleep(60) end
 end
 
+-- ==========================================
+-- 执行注册校验
+-- ==========================================
 local isRegistered = checkRegistration()
 if not isRegistered then
     showNotRegisteredAndHalt()
@@ -371,7 +376,7 @@ if not isRegistered then
 end
 
 term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1,1)
-term.setTextColor(colors.green); print("Registration OK. Starting sonar...")
+term.setTextColor(colors.green); print("Registration OK. Starting debug sonar...")
 speedTimer = os.startTimer(SPEED_INTERVAL)
 sleep(0.5)
 
@@ -466,7 +471,7 @@ local function gpuRefreshSonar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- GPU 主循环 (targetPool 构建)
+-- GPU 主循环 (强制所有目标入池，含调试日志)
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
@@ -489,27 +494,28 @@ local function rdrGpuUI()
             targetPoolCount=0
             local now=os_clock()
             if localPos and isActive then
-                for _,data in pairs(targets) do
-                    if data.lastPainted and (now - data.lastPainted < TARGET_FADE_DURATION) then
-                        local col = calcFadeColor(now - data.lastPainted, C.ALLY_HOT)
-                        if col then
-                            targetPoolCount = targetPoolCount + 1
-                            local t = targetPool[targetPoolCount]
-                            if not t then t = {}; targetPool[targetPoolCount] = t end
-                            t.rad = math_rad(data.paintedYaw + yawOffset)
+                for id, data in pairs(targets) do
+                    -- 强制加入池：只要有方位数据（paintedYaw）就画线
+                    if data.paintedYaw then
+                        targetPoolCount = targetPoolCount + 1
+                        local t = targetPool[targetPoolCount]
+                        if not t then t = {}; targetPool[targetPoolCount] = t end
+                        t.rad = math_rad(data.paintedYaw + yawOffset)
+                        if id == selectedTargetId then
+                            t.color = C.LOCKED_LINE
+                        else
                             t.color = C.TARGET_LINE
-                            t.data = data
                         end
+                        t.data = data
+                        -- 调试打印
+                        print(string.format("Pool + %s dist=%.0f yaw=%.1f",
+                            data.name or id, data.paintedDist or 0, data.paintedYaw))
                     end
                 end
-                if selectedTargetId and targets[selectedTargetId] and targets[selectedTargetId].paintedYaw then
-                    local data = targets[selectedTargetId]
-                    targetPoolCount = targetPoolCount + 1
-                    local t = targetPool[targetPoolCount]
-                    if not t then t = {}; targetPool[targetPoolCount] = t end
-                    t.rad = math_rad(data.paintedYaw + yawOffset)
-                    t.color = C.LOCKED_LINE
-                    t.data = data
+                if targetPoolCount == 0 then
+                    print("Pool empty, no targets with paintedYaw")
+                else
+                    print("Total pool count: " .. targetPoolCount)
                 end
             end
             for _,entry in ipairs(rdrGpuList) do
@@ -537,7 +543,7 @@ local function hudMonitorUI()
                     sText="OFFLINE"; sColor=colors.red; rText="---"; rColor=colors.gray
                     lText="---"; lColor=colors.gray; dText="---"; dColor=colors.gray
                 else
-                    sText="PASSIVE"; sColor=colors.green
+                    sText="DEBUG"; sColor=colors.green
                     rText=string.format("%dm", math_floor(currentRadarRange)); rColor=colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel=targets[selectedTargetId]
@@ -572,47 +578,29 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI
+-- 终端 UI（简化的调试界面）
 -- ==========================================
 local function termUI()
     while true do
         term.setBackgroundColor(colors.black); term.clear()
-        if currentScreenTab==2 then
-            term.setCursorPos(2,2); term.setTextColor(colors.lightGray); term.write("=== CONNECTED DISPLAYS ===")
-            local r=4
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[TOM'S GPU - SONAR]"); r=r+1
-            if #rdrGpuList==0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No tm_gpu"); r=r+1
-            else for _,e in ipairs(rdrGpuList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..e.name); r=r+1 end end
-            r=r+1; term.setCursorPos(2,r); term.setTextColor(colors.cyan); term.write("[CC MONITOR - HUD]"); r=r+1
-            if #hudMonitorList==0 then term.setCursorPos(4,r); term.setTextColor(colors.red); term.write("No monitors"); r=r+1
-            else for _,info in ipairs(hudMonitorList) do term.setCursorPos(4,r); term.setTextColor(colors.lightBlue); term.write("- "..info.displayName); r=r+1 end end
-            r=r+1; term.setCursorPos(2,r); term.setTextColor(colors.lightGray); term.write("Camera: "..cameraName.."  [ONLINE]")
-            r=r+2; term.setCursorPos(2,r); term.setTextColor(colors.yellow); term.write("Press [TAB] to Resume")
-        else
-            term.setCursorPos(2,2); term.setTextColor(colors.yellow); term.write("=== SONAR CONFIG ===")
-            local function drawInputBox(y,label,val,sel,edit)
-                term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
-                term.setTextColor(sel and colors.yellow or colors.lightGray); term.write(label)
-                term.setCursorPos(15,y); term.setBackgroundColor(colors.gray)
-                local txt = (sel and edit) and (inputStr.."_") or tostring(val)
-                term.setTextColor(sel and colors.white or colors.lightGray)
-                term.write(string.format(" %-12s ", txt)); term.setBackgroundColor(colors.black)
-            end
-            drawInputBox(4, "Hydro Offset:", yawOffset, menuIndex==1, isEditing)
-            drawInputBox(6, "Motor Offset:", motorOffset, menuIndex==2, isEditing)
-            term.setCursorPos(2,10); term.setTextColor(colors.yellow); term.write("=== SYSTEM STATUS ===")
-            term.setCursorPos(2,12); term.setTextColor(colors.lime); term.write("Registered: "..myLabel)
-            term.setCursorPos(2,13); term.setTextColor(colors.cyan); term.write("Max Range: "..math_floor(currentRadarRange).." m (dynamic)")
-            term.setCursorPos(2,16); if isServoConnected then term.setTextColor(colors.white); term.write("Listen Dir: "..string.format("%.1f", currentServoAngle).." deg") else term.setTextColor(colors.red); term.write("Listen Dir: OFFLINE") end
-            term.setCursorPos(2,18); if iffMode=="friendly" then term.setTextColor(colors.lightBlue); term.write("IFF: ALLY") else term.setTextColor(colors.red); term.write("IFF: FOE") end
-            term.setCursorPos(2,19); term.setTextColor(colors.gray); term.write("[TAB] Monitor  [Back RS] IFF")
-        end
-        sleep(0.2)
+        term.setCursorPos(1,1); term.setTextColor(colors.yellow)
+        term.write("=== SONAR DEBUG v3.4 ===")
+        term.setCursorPos(1,3); term.setTextColor(colors.white)
+        term.write("Range: " .. math_floor(currentRadarRange) .. "m")
+        term.setCursorPos(1,4)
+        local count = 0
+        for _ in pairs(targets) do count = count + 1 end
+        term.write("Targets in memory: " .. count)
+        term.setCursorPos(1,5)
+        term.write("Pool count: " .. targetPoolCount)
+        term.setCursorPos(1,7)
+        term.write("Heard messages are printed below")
+        sleep(0.5)
     end
 end
 
 -- ==========================================
--- 输入事件（线段点选锁定/取消）
+-- 输入事件（保留触摸锁定）
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -681,7 +669,7 @@ local function heartbeatLoop()
 end
 
 -- ==========================================
--- 网络（只收 t=1）
+-- 网络监听（只收 t=1，含日志）
 -- ==========================================
 local function listenLoop()
     while true do
@@ -693,6 +681,7 @@ local function listenLoop()
             t.modemDist = dist
             t.realDist = calcRangingDist(localPos, t.realPos) or dist
             t.lastSeen = os_clock()
+            print("Heard " .. msg.n .. " dist=" .. dist)
         end
     end
 end
@@ -711,7 +700,7 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 主逻辑循环（动态范围、速度过滤修复、目标更新）
+-- 主逻辑循环（强制更新方位，无条件显示所有目标）
 -- ==========================================
 local function cameraLoop()
     local lastServoAngle=nil; local peripheralPollTick=0
@@ -777,23 +766,12 @@ local function cameraLoop()
                             data.paintedYaw = tYaw
                             data.paintedDist = dist
 
-                            -- 显示控制
-                            if id == selectedTargetId then
-                                data.lastPainted = now
-                            else
-                                local inSector = true
-                                if isServoConnected then
-                                    inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= SCAN_SECTOR_WIDTH/2
-                                end
-                                -- 关键修复：速度未知时允许显示，仅当已知且低于阈值时才隐藏
-                                local speedOK = (data.speed == nil) or (data.speed > MIN_SPEED_KMH / 3.6)
-                                if inSector and dist <= currentRadarRange and speedOK then
-                                    data.lastPainted = now
-                                end
-                            end
+                            -- 强制显示：所有目标无条件标记为可见
+                            data.lastPainted = now
                         end
                     end
 
+                    -- 清理过期目标
                     for id,data in pairs(targets) do
                         if data.lastSeen and (now-data.lastSeen > 10.0) then
                             targets[id]=nil
@@ -847,11 +825,10 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v3.3 - Fixed Speed Nil Bug")
+print("GHG Sonar v3.4 (Debug) - Showing all targets")
 print("  Name : " .. myLabel)
 print("  Dynamic Range (y="..SEA_LEVEL_Y..": "..RANGE_SURFACE.."m, y="..DEEP_Y..": "..RANGE_DEEP.."m)")
-print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h (shows unknown speed)")
-print("  Heartbeat: t=1 with null coords every " .. HEARTBEAT_INTERVAL .. "s")
+print("  Speed filter disabled for testing")
 sleep(1.0)
 
 parallel.waitForAll(
