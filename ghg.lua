@@ -1380,7 +1380,6 @@ parallel.waitForAll(
     hudMonitorUI,
     termUI,
     inputLoop,
-    pingLoop,
     listenLoop,
     cameraLoop,
     rwrRedstoneLoop,
