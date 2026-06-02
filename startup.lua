@@ -5,7 +5,7 @@
 -- ==========================================
 --  全局配置
 -- ==========================================
-local MAX_DISTANCE_LIMIT       = 3700.0   -- 不再使用（动态覆盖）
+local MAX_DISTANCE_LIMIT       = 5000   -- 不再使用（动态覆盖）
 local STRESS_TO_DISTANCE_RATIO = 4.0      -- 不再使用
 local CHANNEL                  = 8888
 local SCAN_SECTOR_WIDTH        = 20       -- 改为监听扇区宽度（保留此变量名）
