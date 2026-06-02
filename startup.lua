@@ -1,4 +1,8 @@
---[[ GHG 被动定向水听器 v3.2 --]]
+--[[ GHG 被动定向水听器 v3.3
+     修复新目标因速度 nil 无法显示的问题
+     心跳发送无害 t=1（坐标0）维持在线
+     动态深度范围、速度过滤、目标线、HUD 优化、完整界面
+--]]
 
 -- ==========================================
 --  全局配置
@@ -12,7 +16,7 @@ local SPEED_INTERVAL           = 3.0     -- 测速间隔
 local MIN_SPEED_KMH            = 4.0     -- 速度过滤阈值
 local HEARTBEAT_INTERVAL       = 5.0     -- 心跳间隔
 
--- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y)
+-- 深度映射 (请修改 SEA_LEVEL_Y 为实际海平面 Y，F3 查看)
 local SEA_LEVEL_Y    = -4
 local RANGE_SURFACE  = 1000
 local RANGE_DEEP     = 5000
@@ -63,12 +67,12 @@ local os_pullEvent = os.pullEvent
 -- 颜色工具
 -- ==========================================
 local function colorUnpack(c)
-    return math_floor(c / 0x10000) % 0x100,
-           math_floor(c / 0x100)   % 0x100,
-           c % 0x100
+    return math_floor(c / 65536) % 256,
+           math_floor(c / 256)   % 256,
+           c % 256
 end
 local function colorPack(r, g, b)
-    return math_floor(r) * 0x10000 + math_floor(g) * 0x100 + math_floor(b)
+    return math_floor(r) * 65536 + math_floor(g) * 256 + math_floor(b)
 end
 local function colorLerp(ca, cb, t)
     t = math_max(0.0, math_min(1.0, t))
@@ -254,7 +258,7 @@ local isHeadless = (#hudMonitorList==0 and #rdrGpuList==0)
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1,1)
-    term.setTextColor(colors.cyan); print("GHG Sonar v3.2 - Registration")
+    term.setTextColor(colors.cyan); print("GHG Sonar v3.3 - Registration")
     term.setTextColor(colors.white); print("My ID: " .. myId); print("Querying scanner...")
 
     for _, entry in ipairs(rdrGpuList) do
@@ -291,11 +295,7 @@ local function checkRegistration()
     end
 end
 
--- ==========================================
--- 未注册显示并停止（完整实现）
--- ==========================================
 local function showNotRegisteredAndHalt()
-    -- GPU 屏幕提示
     for _, entry in ipairs(rdrGpuList) do
         pcall(function()
             local g = entry.gpu
@@ -320,8 +320,6 @@ local function showNotRegisteredAndHalt()
             g.sync()
         end)
     end
-
-    -- HUD 监视器提示
     for _, info in ipairs(hudMonitorList) do
         pcall(function()
             local m = info.m
@@ -342,8 +340,6 @@ local function showNotRegisteredAndHalt()
             m.write(msg3)
         end)
     end
-
-    -- 终端提示
     term.setBackgroundColor(colors.black)
     term.clear()
     local tw, th = term.getSize()
@@ -365,13 +361,9 @@ local function showNotRegisteredAndHalt()
         term.setCursorPos(col, startRow + i - 1)
         term.write(line[1])
     end
-
     while true do sleep(60) end
 end
 
--- ==========================================
--- 执行注册校验
--- ==========================================
 local isRegistered = checkRegistration()
 if not isRegistered then
     showNotRegisteredAndHalt()
@@ -719,7 +711,7 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 主逻辑循环（动态范围、速度过滤、目标更新）
+-- 主逻辑循环（动态范围、速度过滤修复、目标更新）
 -- ==========================================
 local function cameraLoop()
     local lastServoAngle=nil; local peripheralPollTick=0
@@ -785,6 +777,7 @@ local function cameraLoop()
                             data.paintedYaw = tYaw
                             data.paintedDist = dist
 
+                            -- 显示控制
                             if id == selectedTargetId then
                                 data.lastPainted = now
                             else
@@ -792,8 +785,8 @@ local function cameraLoop()
                                 if isServoConnected then
                                     inSector = math_abs(getAngleDiff(tYaw, currentServoAngle)) <= SCAN_SECTOR_WIDTH/2
                                 end
-                                local speedMPS = MIN_SPEED_KMH / 3.6
-                                local speedOK = data.speed and (data.speed > speedMPS)
+                                -- 关键修复：速度未知时允许显示，仅当已知且低于阈值时才隐藏
+                                local speedOK = (data.speed == nil) or (data.speed > MIN_SPEED_KMH / 3.6)
                                 if inSector and dist <= currentRadarRange and speedOK then
                                     data.lastPainted = now
                                 end
@@ -854,10 +847,10 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Sonar v3.2 - Silent Heartbeat")
+print("GHG Sonar v3.3 - Fixed Speed Nil Bug")
 print("  Name : " .. myLabel)
 print("  Dynamic Range (y="..SEA_LEVEL_Y..": "..RANGE_SURFACE.."m, y="..DEEP_Y..": "..RANGE_DEEP.."m)")
-print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h")
+print("  Speed filter: > " .. MIN_SPEED_KMH .. " km/h (shows unknown speed)")
 print("  Heartbeat: t=1 with null coords every " .. HEARTBEAT_INTERVAL .. "s")
 sleep(1.0)
 
