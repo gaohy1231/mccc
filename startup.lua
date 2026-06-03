@@ -1,42 +1,37 @@
 --[[
-GHG Hydrophone (原雷达系统船只端)   v2.0.0 - 水听器改装版
+GHG Hydrophone (原雷达系统船只端)   v2.0.0 - 水听器最终版
 ======================================================================
 改动汇总:
 1. MAX_DISTANCE_LIMIT = 5000
 2. STRESS_TO_DISTANCE_RATIO = 2
-3. 外圈增加 E/S/W 字母及 45° 刻度
-4. 颜色：内外圈/网格 -> 黄色系列，字母 -> 白色，扫描线 -> 白色箭头
+3. 外圈增加 E/S/W 字母及 45° 刻度 (刻度在内侧不出头)
+4. 颜色：外圈 0xFFCC00 内圈 0x997700 网格 0x332200，字母白色，扫描线白色箭头
 5. 完全删除 IFF 模式
-6. 深度动态上限：海平面-4，-14米达到5000上限
-7. 目标测速（改用独立定时器驱动，计算径向速度）
-8. 低速过滤：1秒内均速 <4km/h 不显示方向线
-9. 目标显示改为方向线（圆心到内圈75%处），默认蓝色，锁定红色，点击线锁定，点击空白取消
-10. 方向线上始终标注相对本船方位角（小字）
-11. HUD 布局：GHG hydrophone, 最大距离, 相对/世界方位角, 速度+径向趋势, 距离(调试)
-12. 深度 <= -8 时发送假坐标(0,0,0)，避免接收方崩溃
+6. 深度动态上限：海平面-4 上限1000m，-14 上限5000m，线性过渡
+7. 独立定时器测速 (径向速度 + 高频更新)
+8. 低速过滤: <4km/h 不显示方向线
+9. 目标改为方向线 (圆心->内圈75%)，默认蓝，锁定红；点击线锁定，空白取消
+10. 方向线终点外侧标注相对本船方位角 (0-359° 稳定显示，小字)
+11. HUD 布局: GHG hydrophone, 最大距离, 相对/世界方位角, 速度+径向趋势 (移除距离行)
+12. 深度 <= -8 时发送假坐标 (0,0,0)
 13. RWR 改为接收类型 3 消息触发
 14. 移除主动发送类型 2 锁定消息
-
-Bug 改进：
-A. 采用独立定时器测速（径向速度 + 高频更新）
-B. 深水静默发送假坐标(0,0,0)
-C. GPU 界面颜色调整（外圈亮黄，内圈暗黄，网格褐色），字母/刻度嵌入外圈，目标线缩短，始终标注方位角
 ======================================================================]]
 
 -- ==========================================
 --  全局配置
 -- ==========================================
-local MAX_DISTANCE_LIMIT       = 5000.0                                 -- [CHANGE] 1
-local STRESS_TO_DISTANCE_RATIO = 2.0                                    -- [CHANGE] 2
+local MAX_DISTANCE_LIMIT       = 5000.0
+local STRESS_TO_DISTANCE_RATIO = 2.0
 local CHANNEL                  = 8888
 local SCAN_SECTOR_WIDTH        = 20
-local SEA_LEVEL                = -4                                     -- [CHANGE] 6
+local SEA_LEVEL                = -4
 
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local RWR_ARC_DURATION     = 1.0
-local SPEED_FILTER_MIN     = 4.0    -- km/h                           -- [CHANGE] 8
-local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)           -- [CHANGE] A
+local SPEED_FILTER_MIN     = 4.0    -- km/h
+local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)
 
 local REG_QUERY_TIMEOUT = 5.0
 
@@ -208,7 +203,7 @@ local function rotateVectorFast(vx, vy, vz, qx, qy, qz, qw)
 end
 local function calcRangingDist(refPos, targetPos)
     if not refPos or not targetPos then return nil end
-    if not targetPos.x then return nil end  -- 假坐标防御
+    if not targetPos.x then return nil end
     local dx = targetPos.x - refPos.x
     local dy = targetPos.y - refPos.y
     local dz = targetPos.z - refPos.z
@@ -216,13 +211,13 @@ local function calcRangingDist(refPos, targetPos)
 end
 
 -- ==========================================
--- 颜色常量 (水听器风格) -- [CHANGE] 4,5,C
+-- 颜色常量 (水听器风格，精确值)
 -- ==========================================
 local C = {
     BG          = 0x050A05,
-    OUTER_RING  = 0xFFFF00,  -- 亮黄色（外圈）
-    INNER_RING  = 0x887700,  -- 暗黄色（内圈）
-    GRID        = 0x8B4513,  -- 褐色（网格）
+    OUTER_RING  = 0xFFCC00,  -- 亮黄
+    INNER_RING  = 0x997700,  -- 暗黄
+    GRID        = 0x332200,  -- 深褐
     SWEEP       = 0xFFFFFF,  -- 白色
     YELLOW      = 0xFFFF00,
     WHITE       = 0xFFFFFF,
@@ -258,8 +253,7 @@ for _, name in ipairs(peripheral.getNames()) do
             mode        = monitorModes[name] or "STATUS",
             termRow     = 0,
             lastSText   = nil, lastRText   = nil,
-            lastLText   = nil, lastDText   = nil,
-            lastSpeedText = nil,
+            lastLText   = nil, lastSpeedText = nil,
         })
         mIndex = mIndex + 1
     end
@@ -474,10 +468,7 @@ local function gpuDrawCircle(g, cx, cy, r, color)
         else x = x - 1; d = d + 2*(y-x) + 1 end
     end
 end
-local function gpuDrawTinyTriangle(g, cx, cy, color)
-    g.line(cx, cy-1, cx, cy-1, color)
-    g.line(cx-1, cy, cx+1, cy, color)
-end
+
 local function gpuDrawRadarBase(entry)
     local g=entry.gpu; local cx=entry.cx; local cy=entry.cy; local r=entry.r
     g.fill(C.BG)
@@ -494,7 +485,7 @@ local function gpuDrawRadarBase(entry)
         end
     end
 
-    -- [CHANGE] 3,4,C: 绘制 N/E/S/W 和 45° 刻度线，嵌入外圈
+    -- 绘制方向刻度和字母 (N/E/S/W 嵌入外圈内侧)
     local dirs = {
         {angle=0,   label="N", isTick=false},
         {angle=45,  label="",  isTick=true},
@@ -509,14 +500,14 @@ local function gpuDrawRadarBase(entry)
     for _, d in ipairs(dirs) do
         local dirRad = northRad + math_rad(d.angle)
         if d.isTick then
-            -- 刻度线：从 r-2 到 r+2
-            local startX = cx + math_floor((r-2) * math_sin(dirRad) + 0.5)
-            local startY = cy - math_floor((r-2) * math_cos(dirRad) + 0.5)
-            local endX = cx + math_floor((r+2) * math_sin(dirRad) + 0.5)
-            local endY = cy - math_floor((r+2) * math_cos(dirRad) + 0.5)
-            g.line(startX, startY, endX, endY, C.WHITE)
+            -- 刻度线：从 r-4 到 r，完全在内侧
+            local startX = cx + math_floor((r-4) * math_sin(dirRad) + 0.5)
+            local startY = cy - math_floor((r-4) * math_cos(dirRad) + 0.5)
+            local endX = cx + math_floor(r * math_sin(dirRad) + 0.5)
+            local endY = cy - math_floor(r * math_cos(dirRad) + 0.5)
+            g.line(startX, startY, endX, endY, C.OUTER_RING) -- 刻度线颜色同外圈
         else
-            -- 字母紧贴外圈内侧，绘制在 r-6 处（避免遮挡外圈）
+            -- 字母紧贴外圈内侧，绘制在 r-6 处
             local txX = cx + math_floor((r-6) * math_sin(dirRad) - 3)
             local txY = cy - math_floor((r-6) * math_cos(dirRad) + 4)
             txX = math_max(1, math_min(entry.w-6, txX))
@@ -574,27 +565,28 @@ end
 
 local function gpuRefreshRadar(entry, isActive, poolCount, pool)
     local g=entry.gpu; local cx=entry.cx; local cy=entry.cy
-    local r=entry.r; local lineLength = r * 0.75  -- [CHANGE] C: 方向线缩短至外圈75%
+    local r=entry.r; local lineLength = r * 0.75  -- 目标线缩短至外圈75%
     gpuDrawRadarBase(entry)
     gpuDrawRwrArcs(entry)
     if isActive and localPos then
         for i=1, poolCount do
             local t = pool[i]
             if t and t.col then
-                -- 绘制方向线 (圆心到内圈75%处)
+                -- 绘制方向线 (圆心到75%处)
                 local endX = cx + math_floor(lineLength * t.s + 0.5)
                 local endY = cy - math_floor(lineLength * t.cs + 0.5)
                 g.line(cx, cy, endX, endY, t.col)
-                -- 标注相对本船方位角 (小字)，始终显示
+
+                -- 方位角文本绘制在方向线终点外侧
                 if t.relAngle then
-                    local midX = math_floor(cx + lineLength * 0.8 * t.s + 0.5)
-                    local midY = math_floor(cy - lineLength * 0.8 * t.cs + 0.5) - 6
-                    local angleStr = string.format("%.0f", t.relAngle) .. "°"
-                    local tx = midX - math_floor(#angleStr * 2)
-                    local ty = midY
-                    if tx >= 1 and tx <= entry.w - 10 and ty >= 1 and ty <= entry.h - 8 then
-                        pcall(g.drawText, tx, ty, angleStr, t.col, C.BG, 0.5)
-                    end
+                    local angleStr = tostring(t.relAngle) .. "°"
+                    -- 向外偏移 5 像素
+                    local textX = endX + math_floor(5 * t.s + 0.5)
+                    local textY = endY - math_floor(5 * t.cs + 0.5) - 4  -- 垂直微调
+                    -- 边界限制
+                    textX = math_max(2, math_min(entry.w - #angleStr * 3, textX))
+                    textY = math_max(2, math_min(entry.h - 8, textY))
+                    pcall(g.drawText, textX, textY, angleStr, t.col, C.BG, 0.5)
                 end
             end
         end
@@ -632,8 +624,8 @@ local function rdrGpuUI()
                     if data.lastPainted and not data.isBeacon then
                         local age=now-data.lastPainted
                         if age<TARGET_FADE_DURATION then
-                            -- 速度过滤
-                            if data.speed and data.speed >= SPEED_FILTER_MIN then
+                            -- 速度过滤 (km/h)
+                            if data.speed and (data.speed * 3.6) >= SPEED_FILTER_MIN then
                                 local col = data.isSelected and C.TARGET_LINE_LOCKED or C.TARGET_LINE_DEFAULT
                                 local yawRad = math_rad(data.paintedYaw + yawOffset)
                                 targetPoolCount=targetPoolCount+1
@@ -642,9 +634,9 @@ local function rdrGpuUI()
                                 t.col = col
                                 t.s = math_sin(yawRad)
                                 t.cs = math_cos(yawRad)
-                                -- 计算相对本船方位角
-                                local relAngle = (data.paintedYaw - currentServoAngle) % 360
-                                if relAngle > 180 then relAngle = relAngle - 360 end
+                                -- 计算相对本船方位角 (0-359°)
+                                local relAngle = math_floor((data.paintedYaw - currentServoAngle) % 360 + 0.5)
+                                if relAngle >= 360 then relAngle = relAngle - 360 end
                                 t.relAngle = relAngle
                             end
                         end
@@ -665,7 +657,7 @@ local function rdrGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环
+-- HUD 主循环 (四行布局，移除距离行)
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList==0 then return end
@@ -680,19 +672,20 @@ local function hudMonitorUI()
                 local rText,rColor = "", colors.lime
                 local lText,lColor = "", colors.white
                 local speedText,speedColor = "", colors.white
-                local dText,dColor = "", colors.gray
 
                 if isActive then
                     rText = string.format("%dm", math_floor(currentRadarRange))
                     rColor = colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel = targets[selectedTargetId]
-                        local relBoat = (sel.paintedYaw or 0) - currentServoAngle
-                        relBoat = ((relBoat % 360) + 180) % 360 - 180
-                        local absWorld = sel.paintedYaw or 0
+                        -- 相对本船方位角 (0-359°)
+                        local relBoat = math_floor((sel.paintedYaw or 0) - currentServoAngle + 0.5) % 360
+                        if relBoat >= 360 then relBoat = relBoat - 360 end
+                        local absWorld = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
                         lText = string.format("%.0f / %.0f", relBoat, absWorld)
                         lColor = colors.white
-                        -- 使用径向速度判断接近/远离
+
+                        -- 径向速度趋势
                         local radSpd = sel.radialSpeed or 0
                         local tendency = "="
                         if radSpd > 0.1 then tendency = "A"
@@ -700,33 +693,27 @@ local function hudMonitorUI()
                         local spd = (sel.speed or 0) * 3.6  -- m/s -> km/h
                         speedText = string.format("%.1f km/h %s", spd, tendency)
                         speedColor = colors.white
-                        dText = string.format("%.0f m", sel.realDist or 0)
-                        dColor = colors.gray
                     else
                         lText = "--- / ---"
                         speedText = "---"
-                        dText = "---"
                     end
                 else
                     rText = "---"; rColor = colors.gray
                     lText = "--- / ---"; lColor = colors.gray
                     speedText = "---"; speedColor = colors.gray
-                    dText = "---"; dColor = colors.gray
                 end
 
                 if isFirstFrame or sText~=info.lastSText or rText~=info.lastRText
                     or lText~=info.lastLText or speedText~=info.lastSpeedText
-                    or dText~=info.lastDText
                 then
                     info.m.setTextScale(1)
                     info.m.setBackgroundColor(colors.black)
                     info.m.clear()
                     local dw,dh=info.m.getSize()
-                    local y1 = math_max(1, math_floor(dh/2)-4)
-                    local y2 = math_max(2, math_floor(dh/2)-2)
-                    local y3 = math_max(3, math_floor(dh/2))
-                    local y4 = math_max(4, math_floor(dh/2)+2)
-                    local y5 = math_max(5, math_floor(dh/2)+4)
+                    local y1 = math_max(1, math_floor(dh/2)-3)
+                    local y2 = math_max(2, math_floor(dh/2)-1)
+                    local y3 = math_max(3, math_floor(dh/2)+1)
+                    local y4 = math_max(4, math_floor(dh/2)+3)
                     local function drawCL(txt,col,yPos)
                         info.m.setTextColor(col)
                         local sx=math_max(1, math_floor((dw-#txt)/2)+1)
@@ -736,10 +723,8 @@ local function hudMonitorUI()
                     drawCL(rText,rColor,y2)
                     drawCL(lText,lColor,y3)
                     drawCL(speedText,speedColor,y4)
-                    drawCL(dText,dColor,y5)
                     info.lastSText=sText; info.lastRText=rText
                     info.lastLText=lText; info.lastSpeedText=speedText
-                    info.lastDText=dText
                 end
             end
         end
@@ -959,7 +944,7 @@ local function inputLoop()
                     local bestId = nil
                     local bestDist = 99999
                     for _, data in pairs(targets) do
-                        if data.lastPainted and not data.isBeacon and data.speed and data.speed >= SPEED_FILTER_MIN then
+                        if data.lastPainted and not data.isBeacon and data.speed and (data.speed*3.6) >= SPEED_FILTER_MIN then
                             local yawRad = math_rad(data.paintedYaw + yawOffset)
                             local ex = cx + math_floor(r * 0.75 * math_sin(yawRad) + 0.5)
                             local ey = cy - math_floor(r * 0.75 * math_cos(yawRad) + 0.5)
@@ -1002,7 +987,7 @@ local function pingLoop()
                     v=2, t=1, i=myId, n=myLabel,
                     r=currentRadarRange,
                 }
-                -- [CHANGE] 12,B: 深度 <= -8 时发送假坐标 (0,0,0)
+                -- 深度 <= -8 时发送假坐标 (0,0,0)
                 if localPos.y > -8 then
                     msg.x = math_floor(localPos.x*10)/10
                     msg.y = math_floor(localPos.y*10)/10
@@ -1042,7 +1027,6 @@ local function listenLoop()
                 t.range=msg.r; t.lastSeen=os_clock(); t.isBeacon=false
                 local cd = calcRangingDist(localPos, t.realPos)
                 t.realDist = cd or dist
-                -- 旧的测速逻辑已移至 speedTimerLoop，此处不再处理
             elseif msg.t==3 and msg.ti == myId then
                 -- RWR 响应类型 3
                 local rwrYaw = nil
@@ -1094,7 +1078,7 @@ local function rwrRedstoneLoop()
 end
 
 -- ==========================================
--- 独立测速协程 [CHANGE] A
+-- 独立测速协程
 -- ==========================================
 local function speedTimerLoop()
     while true do
@@ -1108,11 +1092,10 @@ local function speedTimerLoop()
                         local dx = data.realPos.x - data.lastPos.x
                         local dy = data.realPos.y - data.lastPos.y
                         local dz = data.realPos.z - data.lastPos.z
-                        -- 平均速率 (m/s)
                         local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
                         data.speed = dist / dt  -- m/s
 
-                        -- 径向速度（相对于本船，正值远离，负值接近）
+                        -- 径向速度（正值远离，负值接近）
                         if data.realDist and data.realDist > 0.01 and localPos then
                             local relX = data.realPos.x - localPos.x
                             local relY = data.realPos.y - localPos.y
@@ -1251,7 +1234,7 @@ local function cameraLoop()
                                         data.paintedDist=data.realDist
                                         data.paintedYaw=tYaw
                                         data.lastPainted=now
-                                        -- 不再主动发送类型2消息
+                                        -- 不再发送类型2消息
                                         if id==selectedTargetId then
                                             selectedTargetDistStr=string.format(
                                                 "%dm",math_floor(data.realDist+0.5))
@@ -1354,5 +1337,5 @@ parallel.waitForAll(
     listenLoop,
     cameraLoop,
     rwrRedstoneLoop,
-    speedTimerLoop    -- 新增独立测速协程
+    speedTimerLoop
 )
