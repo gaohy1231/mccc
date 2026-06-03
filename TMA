@@ -1,86 +1,79 @@
--- TMA 被动声纳距离解算器 (Target Motion Analysis)
--- 模拟 WWII U-boat 攻击前的目标运动分析流程
--- 仅使用本艇 GPS 坐标和带噪声的目标绝对方位，估算目标距离与航速
--- 操作方法：启动后程序自动模拟潜艇和目标运动，实时显示采集数据和解算结果
+-- TMA被动声纳测距演示 v1.0
+-- 需要: tm_gpu (如果没有, 会自动回退到终端显示)
+-- 自动模拟潜艇机动和目标运动, 演示纯被动方位测距
 
--- ==========================================
--- 配置
--- ==========================================
-local TMA_NOISE_DEG = 2.0    -- 方位测量噪声标准差（度）
-local MIN_TURN_ANGLE = 20.0   -- 视为有效机动的最小航向变化（度）
-local MIN_DATA_POINTS = 5     -- 开始解算的最小数据点数
+-- ========== 配置 ==========
+local TMA_NOISE_DEG = 2.0        -- 方位噪声标准差 (度)
+local MIN_TURN_ANGLE = 20.0      -- 有效机动的最小航向变化 (度)
+local MIN_DATA_POINTS = 5        -- 开始解算的最小数据点数
+local RECORD_INTERVAL = 10.0     -- 数据记录间隔 (秒)
 
--- ==========================================
--- 全局状态
--- ==========================================
-local ownPositions = {}       -- 本艇位置历史 {x=, y=, t=}
-local ownHeadings = {}        -- 本艇航向历史
-local bearings = {}           -- 目标绝对方位（真北，度）
-local times = {}              -- 时间戳
-local solution = nil          -- 估算结果 {x0, y0, vx, vy, dist, speed_kph, heading}
-local isManeuvered = false    -- 是否检测到机动
-local tmaRunning = true
+-- ========== 初始化GPU ==========
+local gpu = peripheral.find("tm_gpu")
+local gpu_w, gpu_h = 256, 128
+if gpu then
+    pcall(gpu.refreshSize)
+    pcall(gpu.setSize, 64)
+    local ok, w, h = pcall(gpu.getSize)
+    if ok then gpu_w, gpu_h = w, h end
+else
+    print("未找到tm_gpu, 将使用终端显示")
+end
 
--- ==========================================
--- 模拟对象：本艇和目标
--- ==========================================
+-- ========== 颜色常量 ==========
+local COL_BG = 0x000000
+local COL_OWN = 0xFFFFFF
+local COL_TGT_TRUE = 0xFF0000
+local COL_TGT_EST = 0x00FF00
+local COL_LINE = 0xFFFF00
+local COL_TEXT = 0x00FF00
+
+-- ========== 模拟初始状态 ==========
 local ownX, ownY = 0, 0
-local ownHeading = 0          -- 航向（度，真北顺时针）
-local ownSpeed = 4.0          -- 节 = 约2.06 m/s
-local targetX, targetY = 2000, 500   -- 目标初始坐标
-local targetHeading = 180     -- 目标航向（真北顺时针），朝向180即向南
-local targetSpeed = 8.0       -- 节 = 约4.12 m/s
+local ownHeading = 0            -- 航向 (度)
+local ownSpeed = 2.0            -- 米/秒 (约4节)
+local targetX, targetY = 2000, 500
+local targetHeading = 180       -- 目标航向 (度)
+local targetSpeed = 4.0         -- 米/秒 (约8节)
 
--- ==========================================
--- 辅助函数：带噪声的目标方位测量
--- ==========================================
+-- ========== 数据记录 ==========
+local ownPositions = {}         -- {x, y}
+local bearings = {}             -- 测得的带噪声绝对方位 (度)
+local times = {}                -- 记录时的模拟时间
+local isManeuvered = false
+local solution = nil
+
+-- ========== 辅助函数: 带噪声的方位测量 ==========
 local function measureBearing()
-    -- 计算真实绝对方位
     local dx = targetX - ownX
     local dy = targetY - ownY
-    local trueBearing = math.deg(math.atan2(dx, dy)) -- atan2(x,y) -> 真北顺时针
+    local trueBearing = math.deg(math.atan2(dx, dy))  -- atan2(x,y) 北顺时针
     trueBearing = (trueBearing + 360) % 360
-    -- 添加高斯噪声（近似）
+    -- 添加近似高斯噪声
     local noise = (math.random() + math.random() + math.random() - 1.5) * TMA_NOISE_DEG * 1.2
-    local measuredBearing = (trueBearing + noise + 360) % 360
-    return measuredBearing
+    local measured = (trueBearing + noise + 360) % 360
+    return measured, trueBearing
 end
 
--- ==========================================
--- 模拟潜艇机动：在某个时刻转向30度
--- ==========================================
-local function simulateManeuver(now)
-    if now > 120 and now < 121 then   -- 第120秒时开始转向
-        ownHeading = ownHeading + 30   -- 右转30度
+-- ========== 模拟机动 ==========
+local function simulateManeuver(simTime)
+    if simTime >= 120 and not isManeuvered then
+        ownHeading = (ownHeading + 30) % 360
         isManeuvered = true
-        term.clear()
-        term.setCursorPos(1,1)
-        print(">>> 潜艇执行 30° 右转！TMA 数据开始有意义 <<<")
     end
 end
 
--- ==========================================
--- TMA 解算：非线性最小二乘（高斯-牛顿法）
--- ==========================================
+-- ========== TMA解算: 简化最小二乘 ==========
 local function solveTMA()
-    if #bearings < MIN_DATA_POINTS then return nil end
-    if not isManeuvered then return nil end   -- 未机动不解算
-
-    -- 提取机动后的数据
-    local idx1 = nil
-    for i = 1, #bearings do
-        if isManeuvered and (times[i] >= 120) then  -- 假设120秒后为机动后
-            idx1 = i
-            break
-        end
+    if #bearings < MIN_DATA_POINTS or not isManeuvered then return nil end
+    -- 仅使用机动后的数据
+    local startIdx = nil
+    for i = 1, #times do
+        if times[i] >= 120 then startIdx = i; break end
     end
-    if not idx1 then return nil end
-
-    local X = {}
-    local Y = {}
-    local T = {}
-    local B = {}
-    for i = idx1, #bearings do
+    if not startIdx then return nil end
+    local X, Y, T, B = {}, {}, {}, {}
+    for i = startIdx, #bearings do
         table.insert(X, ownPositions[i].x)
         table.insert(Y, ownPositions[i].y)
         table.insert(T, times[i])
@@ -88,127 +81,163 @@ local function solveTMA()
     end
     if #B < 4 then return nil end
 
-    -- 初始猜测：默认距离 2000 米，速度 10 节，航向与第一次方位垂直
-    local firstBearing = B[1]
-    local perpHeading = (firstBearing + 90) % 360
-    local initialDist = 2000
-    local initialSpeed = 5.0  -- m/s
-    local guessX = X[1] + initialDist * math.sin(math.rad(firstBearing))
-    local guessY = Y[1] + initialDist * math.cos(math.rad(firstBearing))
-    local guessVx = initialSpeed * math.sin(math.rad(perpHeading))
-    local guessVy = initialSpeed * math.cos(math.rad(perpHeading))
+    -- 初始猜测: 假设目标在第一个方位线2000米处, 速度与第一个方位垂直
+    local initDist = 2000
+    local ang = math.rad(B[1])
+    local guessX = X[1] + initDist * math.sin(ang)
+    local guessY = Y[1] + initDist * math.cos(ang)
+    local guessVx = 3 * math.cos(ang)  -- 初始速度猜测3m/s
+    local guessVy = -3 * math.sin(ang)
 
-    -- 迭代优化
+    -- 高斯-牛顿迭代简化版
     local state = {x0 = guessX, y0 = guessY, vx = guessVx, vy = guessVy}
-    for iter = 1, 10 do
-        local Jx = {0,0,0,0}  -- 简化的雅可比矩阵计算（数值差分）
-        local residuals = {}
-        local sumSq = 0
-
+    for _ = 1, 10 do
+        local gradX, gradY = 0, 0
         for i = 1, #B do
             local t = T[i]
             local predX = state.x0 + state.vx * t
             local predY = state.y0 + state.vy * t
             local dx = predX - X[i]
             local dy = predY - Y[i]
-            local predBearing = math.deg(math.atan2(dx, dy))
-            predBearing = (predBearing + 360) % 360
-            local diff = (B[i] - predBearing + 180) % 360 - 180
-            table.insert(residuals, diff)
-            sumSq = sumSq + diff * diff
-
-            -- 数值偏导（简化）
+            local predBear = math.deg(math.atan2(dx, dy)) % 360
+            local diff = (B[i] - predBear + 180) % 360 - 180
+            -- 数值偏导
             local eps = 1.0
-            local f0 = predBearing
-            local fx = math.deg(math.atan2(dx + eps, dy))
-            local fy = math.deg(math.atan2(dx, dy + eps))
-            Jx[1] = Jx[1] + ((fx - f0) / eps) * diff
-            Jx[2] = Jx[2] + ((fy - f0) / eps) * diff
+            local f0 = predBear
+            local fx = math.deg(math.atan2(dx+eps, dy)) % 360
+            local fy = math.deg(math.atan2(dx, dy+eps)) % 360
+            gradX = gradX + (fx - f0) / eps * diff
+            gradY = gradY + (fy - f0) / eps * diff
         end
-
-        -- 更新（简化梯度下降）
-        local alpha = 0.001
-        state.x0 = state.x0 - alpha * Jx[1]
-        state.y0 = state.y0 - alpha * Jx[2]
-        -- 速度分量保持固定？先只优化位置，稍后完善
-        if sumSq < 1.0 then break end
+        state.x0 = state.x0 - 0.01 * gradX
+        state.y0 = state.y0 - 0.01 * gradY
     end
 
-    -- 计算当前距离和速度
-    local nowX = state.x0 + state.vx * T[#T]
-    local nowY = state.y0 + state.vy * T[#T]
+    -- 计算当前估计距离、速度、航向
+    local tNow = T[#T]
+    local nowX = state.x0 + state.vx * tNow
+    local nowY = state.y0 + state.vy * tNow
     local dx = nowX - X[#X]
     local dy = nowY - Y[#Y]
     local dist = math.sqrt(dx*dx + dy*dy)
     local speed = math.sqrt(state.vx*state.vx + state.vy*state.vy)
     local heading = math.deg(math.atan2(state.vx, state.vy)) % 360
-
-    return {
-        distance = dist,
-        speed_mps = speed,
-        speed_kph = speed * 3.6,
-        heading = heading,
-    }
+    return {dist = dist, speed = speed, heading = heading}
 end
 
--- ==========================================
--- 主循环
--- ==========================================
-local function mainLoop()
-    local startTime = os.clock()
-    local lastRecordTime = 0
-    local lastPrintTime = 0
+-- ========== 运动更新 (每秒10次) ==========
+local simTime = 0
+local lastRecord = 0
+local lastDraw = 0
 
-    while tmaRunning do
-        local now = os.clock() - startTime
-        -- 模拟本艇运动
-        ownX = ownX + ownSpeed * math.sin(math.rad(ownHeading)) * 0.2   -- 0.2秒步长
-        ownY = ownY + ownSpeed * math.cos(math.rad(ownHeading)) * 0.2
-        -- 目标运动
-        targetX = targetX + targetSpeed * math.sin(math.rad(targetHeading)) * 0.2
-        targetY = targetY + targetSpeed * math.cos(math.rad(targetHeading)) * 0.2
+local function update(dt)
+    simTime = simTime + dt
+    ownX = ownX + ownSpeed * math.sin(math.rad(ownHeading)) * dt
+    ownY = ownY + ownSpeed * math.cos(math.rad(ownHeading)) * dt
+    targetX = targetX + targetSpeed * math.sin(math.rad(targetHeading)) * dt
+    targetY = targetY + targetSpeed * math.cos(math.rad(targetHeading)) * dt
+    simulateManeuver(simTime)
+end
 
-        -- 每 10 秒记录一次数据
-        if now - lastRecordTime > 10 then
-            simulateManeuver(now)
-            local bearing = measureBearing()
-            table.insert(ownPositions, {x=ownX, y=ownY})
-            table.insert(ownHeadings, ownHeading)
-            table.insert(bearings, bearing)
+-- ========== GPU绘制 ==========
+local function drawGPU()
+    if not gpu then return end
+    gpu.fill(COL_BG)
+    local scale = 0.05  -- 像素/米, 适合显示2000米范围
+    local cx, cy = gpu_w/2, gpu_h/2
+    -- 坐标转换函数
+    local function toScreen(wx, wy)
+        local sx = cx + (wx - ownX) * scale
+        local sy = cy - (wy - ownY) * scale  -- 屏幕y轴反向
+        return math.max(1, math.min(gpu_w, sx)), math.max(1, math.min(gpu_h, sy))
+    end
+
+    -- 绘制目标真实位置 (红色, 仅用于验证)
+    local tx, ty = toScreen(targetX, targetY)
+    gpu.line(tx-2, ty, tx+2, ty, COL_TGT_TRUE)
+    gpu.line(tx, ty-2, tx, ty+2, COL_TGT_TRUE)
+
+    -- 绘制本艇 (白色)
+    local ox, oy = toScreen(ownX, ownY)
+    gpu.line(ox-3, oy, ox+3, oy, COL_OWN)
+    gpu.line(ox, oy-3, ox, oy+3, COL_OWN)
+
+    -- 绘制最近的几条带噪声的方位线 (黄色虚线)
+    for i = math.max(1, #bearings-3), #bearings do
+        local ang = math.rad(bearings[i])
+        local len = 3000  -- 线长
+        local ex = ownPositions[i].x + len * math.sin(ang)
+        local ey = ownPositions[i].y + len * math.cos(ang)
+        local sx1, sy1 = toScreen(ownPositions[i].x, ownPositions[i].y)
+        local ex1, ey1 = toScreen(ex, ey)
+        for j = 0, 1 do
+            gpu.line(sx1+j, sy1, ex1+j, ey1, COL_LINE)
+        end
+    end
+
+    -- 显示解算结果
+    if solution then
+        gpu.drawText(2, 2, string.format("Dist: %.0f m", solution.dist), COL_TEXT, COL_BG, 1)
+        gpu.drawText(2, 12, string.format("Spd: %.1f km/h", solution.speed * 3.6), COL_TEXT, COL_BG, 1)
+        gpu.drawText(2, 22, string.format("Hdg: %.0f deg", solution.heading), COL_TEXT, COL_BG, 1)
+    else
+        gpu.drawText(2, 2, "Waiting for maneuver...", COL_TEXT, COL_BG, 1)
+    end
+    gpu.drawText(2, gpu_h-10, string.format("Time: %.0f s", simTime), COL_TEXT, COL_BG, 1)
+    gpu.sync()
+end
+
+-- ========== 主循环 ==========
+local function main()
+    local startClock = os.clock()
+    local lastTime = 0
+    while true do
+        local now = os.clock() - startClock
+        local dt = now - lastTime
+        lastTime = now
+        if dt > 1 then dt = 0.1 end  -- 防止大跳跃
+
+        update(dt)
+
+        -- 每隔 RECORD_INTERVAL 记录一次
+        if now - lastRecord >= RECORD_INTERVAL then
+            local measuredBearing, trueBearing = measureBearing()
+            table.insert(ownPositions, {x = ownX, y = ownY})
+            table.insert(bearings, measuredBearing)
             table.insert(times, now)
-            lastRecordTime = now
+            lastRecord = now
         end
 
         -- 尝试解算
         solution = solveTMA()
 
-        -- 每 2 秒刷新终端显示
-        if now - lastPrintTime > 2 then
-            term.clear()
-            term.setCursorPos(1,1)
-            print("=== TMA 被动测距演示 ===")
-            print(string.format("记录点数: %d", #bearings))
-            print(string.format("潜艇机动: %s", isManeuvered and "已完成" or "未机动"))
-            if solution then
-                print("--------------------")
-                print(string.format("估算距离: %.0f 米", solution.distance))
-                print(string.format("目标速度: %.1f km/h", solution.speed_kph))
-                print(string.format("目标航向: %.0f°", solution.heading))
+        -- 刷新显示
+        if now - lastDraw >= 0.5 then
+            if gpu then
+                drawGPU()
             else
-                print("等待机动和数据...")
+                term.clear()
+                term.setCursorPos(1,1)
+                print("TMA Simulation - Time: " .. math.floor(simTime) .. "s")
+                print("Data points: " .. #bearings)
+                print("Maneuvered: " .. tostring(isManeuvered))
+                if solution then
+                    print(string.format("Est. Distance: %.0f m", solution.dist))
+                    print(string.format("Est. Speed: %.1f km/h", solution.speed * 3.6))
+                else
+                    print("Awaiting maneuver...")
+                end
             end
-            lastPrintTime = now
+            lastDraw = now
         end
 
-        sleep(0.1)  -- 模拟实时
+        sleep(0.1)
     end
 end
 
--- ==========================================
 -- 启动
--- ==========================================
 term.clear()
-print("启动被动 TMA 演示...")
-print("潜艇将先直航，约2分钟后右转30°")
-sleep(2)
-mainLoop()
+print("TMA Passive Ranging Demo")
+print("Using GPU: " .. tostring(gpu ~= nil))
+sleep(1)
+main()
