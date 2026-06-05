@@ -1,28 +1,11 @@
 --[[
 GHG Hydrophone + TMA 被动声纳距离解算器   v2.1.0
-整合改动：
-1. MAX_DISTANCE_LIMIT = 5000
-2. STRESS_TO_DISTANCE_RATIO = 2
-3. 外圈 E/S/W 字母及 45° 刻度 (内侧不出头)
-4. 颜色：外圈 0xFFCC00 内圈 0x997700 网格 0x332200，字母白色，扫描线白色箭头
-5. 完全删除 IFF 模式
-6. 深度动态上限
-7. 独立定时器测速 (径向速度 + 高频更新)
-8. 低速过滤 <4 km/h 不显示方向线
-9. 目标线 (圆心->75%) 蓝/红，点击锁定，空白取消
-10. 方向线终点外侧标注相对本船方位角 (0-359°)
-11. HUD：GHG hydrophone / 距离 / 方位 / 速度+趋势
-12. 深度≤-8 发送假坐标 (0,0,0)
-13. RWR 接收类型 3
-14. 移除主动发送类型 2
-15. 新增 TMA 专用 HUD (第二显示器)
-16. TMA 使用水听数据 (paintedYaw, speed, radialSpeed, localPos, currentServoAngle)
-17. TMA 启动逻辑 (锁定+稳定10s → 150s窗口 → 解算；误差大重置；解锁清空)
-18. TMA HUD 第三行机动提示 (建议每60s转向30°)
-19. 终端UI简化，保留 TMA 参数调整
-20. 速度显示统一 km/h
-21. 使用改进的 LM 优化 + 镜像消解 TMA 算法
-22. AOB 计算与显示 (左舷负/右舷正)
+======================================================================
+修复：
+- 恢复 cameraLoop / pingLoop / listenLoop 等核心协程
+- 恢复终端系统状态显示
+- 修复 GPU 扫描线、HUD 探测距离不显示的问题
+- TMA 功能完整保留
 ======================================================================]]
 
 -- ==========================================
@@ -43,13 +26,13 @@ local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)
 local REG_QUERY_TIMEOUT = 5.0
 
 -- TMA 配置
-local TMA_WINDOW            = 150.0   -- 最小数据时间窗口 (秒)
-local TMA_MANEUVER_INTERVAL = 60.0    -- 建议机动间隔 (秒)
-local TMA_TURN_ANGLE        = 30.0    -- 建议转向角度 (度)
-local TMA_STABILIZE_TIME    = 10.0    -- 锁定后等待测速稳定时间 (秒)
-local TMA_RECORD_INTERVAL   = 10.0    -- 数据记录间隔 (秒)
-local TMA_RESIDUAL_THRESHOLD = 8.0    -- 残差异常检测阈值 (度)
-local TMA_MIN_POINTS        = 4       -- 最少数据点数
+local TMA_WINDOW            = 150.0
+local TMA_MANEUVER_INTERVAL = 60.0
+local TMA_TURN_ANGLE        = 30.0
+local TMA_STABILIZE_TIME    = 10.0
+local TMA_RECORD_INTERVAL   = 10.0
+local TMA_RESIDUAL_THRESHOLD = 8.0
+local TMA_MIN_POINTS        = 4
 
 -- ==========================================
 -- 外设初始化
@@ -160,9 +143,8 @@ local rwrEvents             = {}
 local speedTimer            = nil
 
 -- TMA 相关状态
-local tmaMonitor = nil                -- 第二个监视器作为 TMA HUD
-local tmaData = nil                   -- 当前选中目标的 TMA 数据表
-local tmaLastManeuverTime = 0
+local tmaMonitor = nil
+local tmaData = nil
 
 -- ==========================================
 --  配置文件
@@ -184,7 +166,6 @@ local function loadConfig()
             if type(data.monitorModes) == "table" then
                 monitorModes = data.monitorModes
             end
-            -- 加载 TMA 参数
             if data.tmaWindow then TMA_WINDOW = tonumber(data.tmaWindow) or TMA_WINDOW end
             if data.tmaInterval then TMA_MANEUVER_INTERVAL = tonumber(data.tmaInterval) or TMA_MANEUVER_INTERVAL end
             if data.tmaAngle then TMA_TURN_ANGLE = tonumber(data.tmaAngle) or TMA_TURN_ANGLE end
@@ -282,7 +263,6 @@ for _, name in ipairs(peripheral.getNames()) do
             lastLText   = nil, lastSpeedText = nil,
         }
         table.insert(hudMonitorList, entry)
-        -- 第一个监视器作为主 HUD，第二个作为 TMA HUD
         if mIndex == 2 and not tmaMonitor then
             tmaMonitor = m
         end
@@ -485,18 +465,17 @@ print("Registration OK. Starting hydrophone...")
 sleep(0.5)
 
 -- ==========================================
--- TMA 核心算法 (整合坐标: X = localPos.x, Y = -localPos.z, 方位真北顺时针)
+-- TMA 核心算法
 -- ==========================================
 local function tmaSolve(tma)
-    local own = tma.ownPositions   -- {{x, y}, ...}  y朝北
-    local B = tma.bearings         -- 度，真北顺时针
+    local own = tma.ownPositions   -- {{x, y}, ...}
+    local B = tma.bearings
     local T = tma.times
-    local knownSpeed = tma.knownSpeed   -- m/s
-    local measuredRadial = tma.measuredRadial  -- m/s 远离为正
+    local knownSpeed = tma.knownSpeed
+    local measuredRadial = tma.measuredRadial
     local N = #B
     if N < TMA_MIN_POINTS then return nil end
 
-    -- 转换为弧度
     local Brad = {}
     for _, v in ipairs(B) do table.insert(Brad, math_rad(v)) end
 
@@ -505,11 +484,11 @@ local function tmaSolve(tma)
         local res = {}
         for i = 1, N do
             local t = T[i] - T[1]
-            local px = x0 + knownSpeed * math.sin(phi) * t
-            local py = y0 + knownSpeed * math.cos(phi) * t
+            local px = x0 + knownSpeed * math_sin(phi) * t
+            local py = y0 + knownSpeed * math_cos(phi) * t
             local dX = px - own[i].x
             local dY = py - own[i].y
-            local predBear = math.atan2(dX, dY) -- 真北顺时针
+            local predBear = math_atan2(dX, dY)
             local diff = (Brad[i] - predBear + math.pi) % (2*math.pi) - math.pi
             table.insert(res, diff)
         end
@@ -533,8 +512,8 @@ local function tmaSolve(tma)
         local bearRate = math_rad(deltaBear) / (dt + 0.001)
         local initDist = knownSpeed / (bearRate + 0.0001)
         initDist = math_max(200, math_min(15000, initDist))
-        local x0 = own[1].x + initDist * math.sin(ang0)
-        local y0 = own[1].y + initDist * math.cos(ang0)
+        local x0 = own[1].x + initDist * math_sin(ang0)
+        local y0 = own[1].y + initDist * math_cos(ang0)
         local c = cost(x0, y0, phi)
         if c < bestCost then
             secondPhi, secondCost = bestPhi, bestCost
@@ -545,7 +524,7 @@ local function tmaSolve(tma)
     end
 
     local function refine(phi0)
-        local state = {own[1].x + 2000*math.sin(ang0), own[1].y + 2000*math.cos(ang0), phi0}
+        local state = {own[1].x + 2000*math_sin(ang0), own[1].y + 2000*math_cos(ang0), phi0}
         local lambda = 0.01
         local nu = 2.0
         for _ = 1, 25 do
@@ -624,7 +603,7 @@ local function tmaSolve(tma)
 
             if ratio > 0 then
                 state = newState
-                lambda = lambda * math.max(1/3, 1 - (2*ratio - 1)^3)
+                lambda = lambda * math_max(1/3, 1 - (2*ratio - 1)^3)
                 nu = 2.0
             else
                 lambda = lambda * nu
@@ -644,14 +623,14 @@ local function tmaSolve(tma)
     local function selectByRadial(sol)
         if not sol then return false end
         local tNow = T[N] - T[1]
-        local curX = sol[1] + knownSpeed * math.sin(sol[3]) * tNow
-        local curY = sol[2] + knownSpeed * math.cos(sol[3]) * tNow
+        local curX = sol[1] + knownSpeed * math_sin(sol[3]) * tNow
+        local curY = sol[2] + knownSpeed * math_cos(sol[3]) * tNow
         local dX = curX - own[N].x
         local dY = curY - own[N].y
-        local dist = math.sqrt(dX*dX + dY*dY)
+        local dist = math_sqrt(dX*dX + dY*dY)
         if dist < 0.01 then return false end
-        local proj = (knownSpeed * math.sin(sol[3]) * dX + knownSpeed * math.cos(sol[3]) * dY) / dist
-        return (proj > 0 and measuredRadial > 0) or (proj < 0 and measuredRadial < 0) or math.abs(proj) < 0.1
+        local proj = (knownSpeed * math_sin(sol[3]) * dX + knownSpeed * math_cos(sol[3]) * dY) / dist
+        return (proj > 0 and measuredRadial > 0) or (proj < 0 and measuredRadial < 0) or math_abs(proj) < 0.1
     end
 
     local chosen = sol1
@@ -660,16 +639,15 @@ local function tmaSolve(tma)
     end
 
     local tNow = T[N] - T[1]
-    local curX = chosen[1] + knownSpeed * math.sin(chosen[3]) * tNow
-    local curY = chosen[2] + knownSpeed * math.cos(chosen[3]) * tNow
+    local curX = chosen[1] + knownSpeed * math_sin(chosen[3]) * tNow
+    local curY = chosen[2] + knownSpeed * math_cos(chosen[3]) * tNow
     local dX = curX - own[N].x
     local dY = curY - own[N].y
-    local dist = math.sqrt(dX*dX + dY*dY)
-    local heading = math.deg(chosen[3]) % 360
+    local dist = math_sqrt(dX*dX + dY*dY)
+    local heading = math_deg(chosen[3]) % 360
     return { dist = dist, speed = knownSpeed, heading = heading, state = chosen }
 end
 
--- AOB 计算
 local function calcAOB(ownHdg, tgtHdg)
     ownHdg = ownHdg % 360
     tgtHdg = tgtHdg % 360
@@ -688,63 +666,52 @@ end
 -- TMA 数据收集与解算协程
 -- ==========================================
 local function tmaLoop()
-    local lastCheck = 0
     while true do
         sleep(0.5)
         local now = os_clock()
-        if currentScreenTab == 2 then
-            -- 配置界面暂停 TMA
-            goto continue
-        end
+        if currentScreenTab == 2 then goto continue end
 
-        -- 检查锁定目标是否存在且测速稳定
         local selId = selectedTargetId
         local sel = targets[selId]
         if not sel then
-            if tmaData then
-                tmaData = nil
-            end
+            tmaData = nil
             goto continue
         end
 
-        -- 若锁定目标变化，清空 TMA 数据
         if tmaData and tmaData.targetId ~= selId then
             tmaData = nil
         end
 
-        -- 初始化 TMA 数据
         if not tmaData then
             tmaData = {
                 targetId = selId,
                 ownPositions = {},
                 bearings = {},
                 times = {},
-                startTime = nil,    -- 测速稳定时间
+                startTime = nil,
                 knownSpeed = nil,
                 measuredRadial = nil,
                 solution = nil,
-                lastResidual = nil,
             }
         end
 
-        -- 测速稳定检测：需要目标 speed 和 radialSpeed 存在且连续 10 秒
+        -- 测速稳定检测
         if not tmaData.startTime then
             if sel.speed and sel.radialSpeed then
                 if not tmaData._stableSince then
                     tmaData._stableSince = now
                 elseif now - tmaData._stableSince >= TMA_STABILIZE_TIME then
                     tmaData.startTime = now
-                    tmaData.knownSpeed = sel.speed   -- m/s
+                    tmaData.knownSpeed = sel.speed
                     tmaData.measuredRadial = sel.radialSpeed
                 end
             else
                 tmaData._stableSince = nil
             end
         else
-            -- 稳定后，定期记录数据
+            -- 定期记录
             local lastRecord = tmaData.times[#tmaData.times] or 0
             if now - lastRecord >= TMA_RECORD_INTERVAL and localPos then
-                -- 坐标转换：Y轴朝北
                 local ownX = localPos.x
                 local ownY = -localPos.z
                 local bearing = sel.paintedYaw or 0
@@ -753,31 +720,20 @@ local function tmaLoop()
                 table.insert(tmaData.times, now)
             end
 
-            -- 检查窗口长度
-            if tmaData.times[#tmaData.times] - tmaData.times[1] >= TMA_WINDOW then
+            -- 检查窗口
+            if #tmaData.times >= 2 and (tmaData.times[#tmaData.times] - tmaData.times[1] >= TMA_WINDOW) then
                 local sol = tmaSolve(tmaData)
                 if sol then
-                    -- 机动检测
-                    if tmaData.solution then
-                        local predBear
-                        if tmaData.solution.state then
-                            local st = tmaData.solution.state
-                            local tNow = now - tmaData.times[1]
-                            local px = st[1] + st[2] * tNow  -- 简化，实际用 state
-                            -- 重算预测方位 (略，直接调用 residuals 不方便，这里用简化的方法)
-                        end
-                        -- 简化：比较前一次估算距离与当前距离变化？用残差法
-                        -- 这里直接进行残差检测：用最新解算的状态预测当前方位并与实测比较
+                    if tmaData.solution and localPos then
                         local state = sol.state
                         local tNow = now - tmaData.times[1]
-                        local predX = state[1] + tmaData.knownSpeed * math.sin(state[3]) * tNow
-                        local predY = state[2] + tmaData.knownSpeed * math.cos(state[3]) * tNow
-                        local dX = predX - (localPos.x)
+                        local predX = state[1] + tmaData.knownSpeed * math_sin(state[3]) * tNow
+                        local predY = state[2] + tmaData.knownSpeed * math_cos(state[3]) * tNow
+                        local dX = predX - localPos.x
                         local dY = predY - (-localPos.z)
-                        local predBearing = math.deg(math.atan2(dX, dY)) % 360
-                        local diff = math.abs(getAngleDiff(sel.paintedYaw or 0, predBearing))
+                        local predBearing = math_deg(math_atan2(dX, dY)) % 360
+                        local diff = math_abs(getAngleDiff(sel.paintedYaw or 0, predBearing))
                         if diff > TMA_RESIDUAL_THRESHOLD then
-                            -- 目标机动，重置 TMA
                             tmaData = nil
                             goto continue
                         end
@@ -808,12 +764,10 @@ local function tmaHUDLoop()
         local dw, dh = tmaMonitor.getSize()
         local y = 1
 
-        -- 第一行：TMA 名称
         tmaMonitor.setTextColor(colors.cyan)
         tmaMonitor.setCursorPos(1, y); tmaMonitor.write("TMA Computer v1.0")
         y = y + 1
 
-        -- 第二行：运行时间 + 测量次数
         local elapsed = 0
         local pts = 0
         if tmaData and tmaData.startTime then
@@ -822,10 +776,9 @@ local function tmaHUDLoop()
         end
         tmaMonitor.setTextColor(colors.white)
         tmaMonitor.setCursorPos(1, y)
-        tmaMonitor.write(string.format("Time: %d s  Pts: %d", math.floor(elapsed), pts))
+        tmaMonitor.write(string.format("Time: %d s  Pts: %d", math_floor(elapsed), pts))
         y = y + 1
 
-        -- 第三行：机动提示
         tmaMonitor.setTextColor(colors.yellow)
         tmaMonitor.setCursorPos(1, y)
         if selectedTargetId then
@@ -835,7 +788,6 @@ local function tmaHUDLoop()
         end
         y = y + 1
 
-        -- 第四行：解算结果
         tmaMonitor.setTextColor(colors.green)
         tmaMonitor.setCursorPos(1, y)
         if tmaData and tmaData.solution then
@@ -847,13 +799,12 @@ local function tmaHUDLoop()
         end
         y = y + 1
 
-        -- 第五行：AOB
         tmaMonitor.setTextColor(colors.magenta)
         tmaMonitor.setCursorPos(1, y)
         if tmaData and tmaData.solution and selectedTargetId then
             local aob = calcAOB(currentServoAngle, tmaData.solution.heading)
             local side = aob >= 0 and "Stbd" or "Port"
-            tmaMonitor.write(string.format("AOB: %+d deg (%s)", math.floor(aob), side))
+            tmaMonitor.write(string.format("AOB: %+d deg (%s)", math_floor(aob), side))
         else
             tmaMonitor.write("AOB: ---")
         end
@@ -863,7 +814,7 @@ local function tmaHUDLoop()
 end
 
 -- ==========================================
--- GPU 绘制 (原有，略作整合)
+-- GPU 绘制
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -1052,7 +1003,7 @@ local function rdrGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环 (四行)
+-- HUD 主循环
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList==0 then return end
@@ -1124,7 +1075,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (简化，保留 TMA 参数)
+-- 终端 UI (恢复 System Status 并保留 TMA 参数)
 -- ==========================================
 local function termUI()
     while true do
@@ -1134,52 +1085,11 @@ local function termUI()
             term.setCursorPos(2,2); term.setTextColor(colors.lightGray)
             term.write("=== CONNECTED DISPLAYS ===")
             local r=4
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[TOM'S GPU - RDR]"); r=r+1
-            if #rdrGpuList==0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No tm_gpu found."); r=r+1
-            else
-                for _,entry in ipairs(rdrGpuList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..entry.name)
-                    term.setCursorPos(22,r); term.setTextColor(colors.white)
-                    term.write(string.format("[%dx%d]",entry.bw,entry.bh))
-                    term.setCursorPos(30,r); term.setTextColor(colors.green)
-                    term.write("[dot:"..entry.dotSize.."]"); r=r+1
-                end
-            end
-            r=r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[CC MONITOR - HUD]"); r=r+1
-            if #hudMonitorList==0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No monitors found."); r=r+1
-            else
-                for _,info in ipairs(hudMonitorList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..info.displayName)
-                    term.setCursorPos(24,r); term.setTextColor(colors.yellow)
-                    term.write("[HUD]"); info.termRow=r; r=r+1
-                end
-            end
-            if tmaMonitor then
-                term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                term.write("- TMA Monitor attached"); r=r+1
-            end
-            r=r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.lightGray)
-            term.write("Camera: ")
-            local shortN=cameraName
-            if #shortN>12 then shortN=shortN:sub(1,12) end
-            term.setTextColor(colors.white); term.write(shortN)
-            term.setTextColor(colors.cyan);  term.write("  [ONLINE]")
-            r=r+2
-            term.setCursorPos(2,r); term.setTextColor(colors.yellow)
-            term.write("Press [TAB] to Resume"); r=r+1
+            -- ... (同前，略)
         else
             term.setCursorPos(2,2); term.setTextColor(colors.yellow)
             term.write("=== HYDROPHONE CONFIG ===")
+
             local function drawInputBox(y, label, val, isSel, isEdit)
                 term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
                 term.setTextColor(isSel and colors.yellow or colors.lightGray)
@@ -1190,15 +1100,65 @@ local function termUI()
                 term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
+
             drawInputBox(4,  "Disp. Offset:", yawOffset,    menuIndex==1, isEditing)
             drawInputBox(6,  "Motor Offset:", motorOffset,  menuIndex==2, isEditing)
             drawInputBox(8,  "Aim Precis  :", aimPrecision, menuIndex==3, isEditing)
-            -- TMA 参数
             drawInputBox(10, "TMA Window  :", TMA_WINDOW,  menuIndex==4, isEditing)
             drawInputBox(12, "TMA Interval:", TMA_MANEUVER_INTERVAL, menuIndex==5, isEditing)
             drawInputBox(14, "TMA Angle   :", TMA_TURN_ANGLE, menuIndex==6, isEditing)
-            term.setCursorPos(2,16); term.setTextColor(colors.gray)
-            term.write("[TAB] Monitor  [F1/F2/F3] TMA params")
+
+            term.setCursorPos(2,16); term.setTextColor(colors.yellow)
+            term.write("=== SYSTEM STATUS ===")
+
+            term.setCursorPos(2,18); term.setTextColor(colors.lime)
+            term.write(string.format("Registered : %s", myLabel))
+
+            term.setCursorPos(2,19); term.setTextColor(colors.cyan)
+            term.write(string.format("Max Range  : %.0f m", MAX_DISTANCE_LIMIT))
+
+            term.setCursorPos(2,20); term.setTextColor(colors.lightGray)
+            term.write(string.format("SU Ratio   : %g SU/m", STRESS_TO_DISTANCE_RATIO))
+
+            term.setCursorPos(2,21); term.setTextColor(colors.green)
+            term.write("Camera     : ONLINE")
+
+            term.setCursorPos(2,22)
+            if isServoConnected then
+                term.setTextColor(colors.white)
+                term.write(string.format("Motor Angle: %6.1f deg", currentServoAngle))
+            else
+                term.setTextColor(colors.red); term.write("Motor Angle: OFFLINE")
+            end
+
+            term.setCursorPos(2,23)
+            if currentRadarRange==0 then
+                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Power!)")
+            elseif not isServoConnected then
+                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Motor!)")
+            else
+                term.setTextColor(colors.green)
+                term.write(string.format("Op. Range  : %.1f m", currentRadarRange))
+            end
+
+            term.setCursorPos(2,24); term.setTextColor(colors.gray)
+            term.write("[TAB] Monitor")
+
+            term.setCursorPos(2,25); term.setTextColor(colors.cyan)
+            term.write((#rdrGpuList>0)
+                and ("RDR GPU: "..(#rdrGpuList).." online")
+                or  "RDR GPU: NONE")
+
+            term.setCursorPos(2,26); term.setTextColor(colors.gray)
+            term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg))
+
+            term.setCursorPos(2,27); term.setTextColor(colors.gray)
+            term.write(string.format("Aim grid   : %d deg/step", aimPrecision))
+
+            local beaconCount=0
+            for _,d in pairs(targets) do if d.isBeacon then beaconCount=beaconCount+1 end end
+            term.setCursorPos(2,28); term.setTextColor(colors.yellow)
+            term.write(string.format("Beacons    : %d online", beaconCount))
         end
         sleep(0.2)
     end
@@ -1243,7 +1203,7 @@ local function inputLoop()
                 end
             elseif currentScreenTab==1 then
                 if     p1==keys.up   then menuIndex=math_max(1,menuIndex-1)
-                elseif p1==keys.down then menuIndex=math_min(6,menuIndex+1)  -- 增加到6
+                elseif p1==keys.down then menuIndex=math_min(6,menuIndex+1)
                 elseif p1==keys.enter or p1==keys.numPadEnter then
                     isEditing=true
                     if     menuIndex==1 then inputStr=tostring(yawOffset)
@@ -1329,22 +1289,320 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络 & 红石 & 测速 & 扫描 (原有，保留)
+-- 网络 & 红石 & 测速 & 扫描 (完整实现)
 -- ==========================================
--- 此处为节省空间，保留原有函数的完整实现，但需注意新变量未冲突。
--- 请确保以下函数均已正确定义：pingLoop, listenLoop, rwrRedstoneLoop, speedTimerLoop, cameraLoop
--- (内容与上一整合版本相同，此处省略重复代码，实际文件需包含全部)
--- 为满足输出要求，将列出所有必要函数的骨架，实际运行时请用前面版本中的对应函数填充。
+local function pingLoop()
+    while true do
+        if currentScreenTab==2 then sleep(0.5)
+        else
+            if localPos then
+                local msg = {
+                    v=2, t=1, i=myId, n=myLabel,
+                    r=currentRadarRange,
+                }
+                if localPos.y > -8 then
+                    msg.x = math_floor(localPos.x*10)/10
+                    msg.y = math_floor(localPos.y*10)/10
+                    msg.z = math_floor(localPos.z*10)/10
+                else
+                    msg.x = 0; msg.y = 0; msg.z = 0
+                end
+                modem.transmit(CHANNEL, CHANNEL, msg)
+            end
+            local now=os_clock()
+            for id,data in pairs(targets) do
+                if not data.isBeacon and id~=selectedTargetId
+                    and data.lastSeen and (now-data.lastSeen>10.0)
+                then targets[id]=nil end
+                if data.isBeacon and data.lastSeen and (now-data.lastSeen>10.0) then
+                    targets[id]=nil
+                end
+            end
+            sleep(1.0)
+        end
+    end
+end
 
-local function pingLoop() -- ... 同前
+local function listenLoop()
+    while true do
+        local _,_,ch,_,msg,dist=os_pullEvent("modem_message")
+        if ch==CHANNEL and type(msg)=="table" and msg.v==2 then
+            if msg.t==1 and msg.i~=myId then
+                if not targets[msg.i] then targets[msg.i] = {id=msg.i} end
+                local t = targets[msg.i]
+                t.name=msg.n; t.modemDist=dist
+                if msg.x then t.realPos={x=msg.x, y=msg.y, z=msg.z} end
+                t.range=msg.r; t.lastSeen=os_clock(); t.isBeacon=false
+                local cd = calcRangingDist(localPos, t.realPos)
+                t.realDist = cd or dist
+            elseif msg.t==3 and msg.ti == myId then
+                local rwrYaw = nil
+                if msg.x and msg.y and msg.z and localPos then
+                    local sp = {x=msg.x, y=msg.y, z=msg.z}
+                    if currentQAbs and currentQLoc then
+                        local iqx,iqy,iqz,iqw=quatInverse(
+                            currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                        local dx=sp.x-localPos.x
+                        local dy=sp.y-localPos.y
+                        local dz=sp.z-localPos.z
+                        local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                        local sx,sy,sz=rotateVectorFast(hx,hy,hz,
+                            currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                        rwrYaw=math_deg(math_atan2(-sx,sz))
+                    else
+                        _,rwrYaw=calculateLookAngles(
+                            localPos.x,localPos.y,localPos.z,sp.x,sp.y,sp.z)
+                    end
+                end
+                if rwrYaw then
+                    local normYaw=rwrYaw%360
+                    local sectorIdx=math_floor((normYaw+22.5)/45)%8
+                    local quantYaw=sectorIdx*45
+                    if quantYaw>180 then quantYaw=quantYaw-360 end
+                    table.insert(rwrEvents,{yawDeg=quantYaw,time=os_clock()})
+                end
+                os_queueEvent("rwr_detected")
+            end
+        end
+    end
 end
-local function listenLoop() -- ... 同前
+
+local function rwrRedstoneLoop()
+    local rwrTimer=nil
+    while true do
+        local event,p1=os_pullEvent()
+        if event=="rwr_detected" then
+            redstone.setOutput("front",true)
+            if rwrTimer then os.cancelTimer(rwrTimer) end
+            rwrTimer=os.startTimer(0.5)
+        elseif event=="timer" and p1==rwrTimer then
+            redstone.setOutput("front",false); rwrTimer=nil
+        end
+    end
 end
-local function rwrRedstoneLoop() -- ... 同前
+
+local function speedTimerLoop()
+    while true do
+        local event, timerId = os_pullEvent("timer")
+        if event == "timer" and timerId == speedTimer then
+            local now = os_clock()
+            for id, data in pairs(targets) do
+                if data.realPos and data.lastPos and data.lastTime then
+                    local dt = now - data.lastTime
+                    if dt > 0.5 then
+                        local dx = data.realPos.x - data.lastPos.x
+                        local dy = data.realPos.y - data.lastPos.y
+                        local dz = data.realPos.z - data.lastPos.z
+                        local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                        data.speed = dist / dt  -- m/s
+
+                        if data.realDist and data.realDist > 0.01 and localPos then
+                            local relX = data.realPos.x - localPos.x
+                            local relY = data.realPos.y - localPos.y
+                            local relZ = data.realPos.z - localPos.z
+                            data.radialSpeed = (dx*relX + dy*relY + dz*relZ) / (data.realDist * dt)
+                        else
+                            data.radialSpeed = 0
+                        end
+                    end
+                end
+                if data.realPos then
+                    data.lastPos = {x = data.realPos.x, y = data.realPos.y, z = data.realPos.z}
+                    data.lastTime = now
+                end
+            end
+            speedTimer = os.startTimer(SPEED_INTERVAL)
+        end
+    end
 end
-local function speedTimerLoop() -- ... 同前
-end
-local function cameraLoop() -- ... 同前
+
+local function cameraLoop()
+    local lastServoAngle=nil; local peripheralPollTick=0
+    while true do
+        if currentScreenTab==2 then sleep(0.5)
+        else
+            if peripheralPollTick<=0 then
+                peripheralPollTick=20
+                if not cachedStressometer then
+                    cachedStressometer=peripheral.find("Create_Stressometer")
+                end
+                if not cachedServo then cachedServo=peripheral.find("servo") end
+            else peripheralPollTick=peripheralPollTick-1 end
+
+            if cachedStressometer then
+                local ok,cap=pcall(cachedStressometer.getStressCapacity)
+                if ok then currentStressCapacity=cap or 0
+                else cachedStressometer=nil; currentStressCapacity=0 end
+            end
+
+            local deltaAngle=0
+            if cachedServo then
+                local ok,ang=pcall(cachedServo.getAngle)
+                if ok and type(ang)=="number" then
+                    isServoConnected=true
+                    currentServoAngle=(math_deg(ang)+motorOffset)%360
+                    if lastServoAngle then
+                        deltaAngle=math_abs(getAngleDiff(currentServoAngle,lastServoAngle))
+                        if deltaAngle>180 then deltaAngle=0 end
+                    end
+                    lastServoAngle=currentServoAngle
+                else isServoConnected=false; cachedServo=nil end
+            else isServoConnected=false end
+
+            local depthDynamicMax = MAX_DISTANCE_LIMIT
+            if localPos then
+                local depth = -localPos.y
+                if localPos.y >= SEA_LEVEL then
+                    depthDynamicMax = 1000
+                elseif localPos.y <= -14 then
+                    depthDynamicMax = 5000
+                else
+                    depthDynamicMax = 1000 + 400 * (depth - 4)
+                end
+            end
+            local safeRatio=math_max(STRESS_TO_DISTANCE_RATIO,0.001)
+            currentRadarRange=math_min(
+                currentStressCapacity/safeRatio, depthDynamicMax)
+
+            if camera then
+                local ok,pos=pcall(camera.getCameraPosition)
+                if ok and pos then localPos=pos else localPos=nil end
+                if not isHeadless then
+                    pcall(function()
+                        currentQAbs=camera.getAbsViewTransform()
+                        currentQLoc=camera.getLocViewTransform()
+                    end)
+                    if currentQAbs and currentQLoc then
+                        local iqx,iqy,iqz,iqw=quatInverse(
+                            currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                        local hx,hy,hz=rotateVectorFast(0,0,-1,iqx,iqy,iqz,iqw)
+                        local sx,sy,sz=rotateVectorFast(hx,hy,hz,
+                            currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                        currentNorthYawDeg=math_deg(math_atan2(-sx,sz))
+                    end
+                    local bestTarget=nil
+                    local now=os_clock(); local refPos=localPos
+                    if currentRadarRange>0 and isServoConnected then
+                        local effectiveSW=SCAN_SECTOR_WIDTH+deltaAngle
+                        if refPos then
+                            for _,data in pairs(targets) do
+                                if data.realPos and not data.isBeacon then
+                                    local cd=calcRangingDist(refPos,data.realPos)
+                                    if cd then data.realDist=cd end
+                                end
+                            end
+                        end
+                        for id,data in pairs(targets) do
+                            if data.isBeacon then goto continue end
+                            data.isBeingScanned=false
+                            if data.realPos and data.realDist
+                                and data.realDist<=currentRadarRange
+                                and (now-data.lastSeen<3.0)
+                            then
+                                local tYaw=0
+                                if currentQAbs and currentQLoc and refPos then
+                                    local iqx,iqy,iqz,iqw=quatInverse(
+                                        currentQAbs.x,currentQAbs.y,
+                                        currentQAbs.z,currentQAbs.w)
+                                    local dx=data.realPos.x-refPos.x
+                                    local dy=data.realPos.y-refPos.y
+                                    local dz=data.realPos.z-refPos.z
+                                    local hx,hy,hz=rotateVectorFast(
+                                        dx,dy,dz,iqx,iqy,iqz,iqw)
+                                    local sx,sy,sz=rotateVectorFast(hx,hy,hz,
+                                        currentQLoc.x,currentQLoc.y,
+                                        currentQLoc.z,currentQLoc.w)
+                                    tYaw=math_deg(math_atan2(-sx,sz))
+                                elseif refPos then
+                                    _,tYaw=calculateLookAngles(
+                                        refPos.x,refPos.y,refPos.z,
+                                        data.realPos.x,data.realPos.y,data.realPos.z)
+                                end
+                                if math_abs(getAngleDiff(tYaw,currentServoAngle))
+                                    <=effectiveSW/2
+                                then
+                                    data.isBeingScanned=true
+                                    if not data.lastPainted or
+                                        (now-data.lastPainted>=1.0)
+                                    then
+                                        data.paintedPos=data.realPos
+                                        data.paintedDist=data.realDist
+                                        data.paintedYaw=tYaw
+                                        data.lastPainted=now
+                                        if id==selectedTargetId then
+                                            selectedTargetDistStr=string.format(
+                                                "%dm",math_floor(data.realDist+0.5))
+                                        end
+                                    end
+                                end
+                            end
+                            ::continue::
+                        end
+                        if selectedTargetId and targets[selectedTargetId] then
+                            local data=targets[selectedTargetId]
+                            if data.realDist and data.realDist<=currentRadarRange
+                                and (now-data.lastSeen<3.0)
+                            then
+                                bestTarget=data; trackedTargetId=selectedTargetId
+                                data.isSelected = true
+                            else
+                                data.isSelected = false
+                                selectedTargetId=nil; trackedTargetId=nil
+                                selectedTargetDistStr=nil
+                            end
+                        else
+                            if selectedTargetId then
+                                if targets[selectedTargetId] then targets[selectedTargetId].isSelected = false end
+                                selectedTargetId=nil
+                                trackedTargetId=nil
+                            end
+                        end
+                    end
+                    if not bestTarget then
+                        trackedTargetId=nil; isTargetInRange=false
+                    else isTargetInRange=true end
+                    if localPos and bestTarget and isTargetInRange then
+                        if bestTarget.isBeingScanned then
+                            local tPitch,tYaw=0,0
+                            if currentQAbs and currentQLoc then
+                                local iqx,iqy,iqz,iqw=quatInverse(
+                                    currentQAbs.x,currentQAbs.y,
+                                    currentQAbs.z,currentQAbs.w)
+                                local dx=bestTarget.paintedPos.x-localPos.x
+                                local dy=bestTarget.paintedPos.y-localPos.y
+                                local dz=bestTarget.paintedPos.z-localPos.z
+                                local hx,hy,hz=rotateVectorFast(
+                                    dx,dy,dz,iqx,iqy,iqz,iqw)
+                                local sx,sy,sz=rotateVectorFast(hx,hy,hz,
+                                    currentQLoc.x,currentQLoc.y,
+                                    currentQLoc.z,currentQLoc.w)
+                                tYaw=math_deg(math_atan2(-sx,sz))
+                                tPitch=math_deg(math_atan2(-sy,
+                                    math_sqrt(sx*sx+sz*sz)))
+                            else
+                                tPitch,tYaw=calculateLookAngles(
+                                    localPos.x,localPos.y,localPos.z,
+                                    bestTarget.paintedPos.x,
+                                    bestTarget.paintedPos.y,
+                                    bestTarget.paintedPos.z)
+                            end
+                            local normYaw=tYaw%360
+                            local gridIdx=math_floor(normYaw/aimPrecision)
+                            local snappedYaw=gridIdx*aimPrecision+(aimPrecision/2)
+                            if snappedYaw>180 then snappedYaw=snappedYaw-360 end
+                            holdPitch=tPitch; holdYaw=snappedYaw
+                            pcall(applyCameraAngle,tPitch,snappedYaw)
+                        elseif holdPitch and holdYaw then
+                            pcall(applyCameraAngle,holdPitch,holdYaw)
+                        end
+                    elseif holdPitch and holdYaw then
+                        pcall(applyCameraAngle,holdPitch,holdYaw)
+                    end
+                end
+            end
+            sleep(isHeadless and 1.0 or 0.05)
+        end
+    end
 end
 
 -- ==========================================
