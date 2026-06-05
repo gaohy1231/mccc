@@ -1,11 +1,10 @@
 --[[
-GHG Hydrophone + TMA 被动声纳距离解算器   v2.1.0
-======================================================================
-修复：
-- 恢复 cameraLoop / pingLoop / listenLoop 等核心协程
-- 恢复终端系统状态显示
-- 修复 GPU 扫描线、HUD 探测距离不显示的问题
-- TMA 功能完整保留
+GHG Hydrophone + TMA 被动声纳距离解算器   v2.2.0
+改进：
+- 终端 UI 三页 (配置参数 / 系统状态 / 显示器列表)
+- TMA 专用 HUD (第二个监视器) 独立绘制
+- 速度测量补偿服务器 TPS (基于 os.epoch)
+- 保留所有水听器原有功能 (方向线、RWR、测速过滤等)
 ======================================================================]]
 
 -- ==========================================
@@ -131,7 +130,7 @@ local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
 local currentNorthYawDeg    = 0
-local currentScreenTab      = 1
+local currentScreenTab      = 1   -- 1=配置, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
@@ -145,6 +144,10 @@ local speedTimer            = nil
 -- TMA 相关状态
 local tmaMonitor = nil
 local tmaData = nil
+
+-- TPS 估算
+local tpsEstimate = 20.0
+local lastEpoch, lastClock = 0, 0
 
 -- ==========================================
 --  配置文件
@@ -239,7 +242,7 @@ local C = {
 }
 
 -- ==========================================
--- HUD / TMA Monitor 列表
+-- HUD / TMA Monitor 分配
 -- ==========================================
 local hudMonitorList = {}
 local mIndex = 1
@@ -263,6 +266,7 @@ for _, name in ipairs(peripheral.getNames()) do
             lastLText   = nil, lastSpeedText = nil,
         }
         table.insert(hudMonitorList, entry)
+        -- 第二个监视器自动分配给 TMA
         if mIndex == 2 and not tmaMonitor then
             tmaMonitor = m
         end
@@ -275,7 +279,6 @@ end
 -- ==========================================
 local BLOCK_PX_W = 85
 local BLOCK_PX_H = 64
-
 local rdrGpuList = {}
 local gpuNameMap = {}
 
@@ -317,7 +320,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Hydrophone v2.1.0 - Registration Check")
+    print("Hydrophone v2.2.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -669,8 +672,7 @@ local function tmaLoop()
     while true do
         sleep(0.5)
         local now = os_clock()
-        if currentScreenTab == 2 then goto continue end
-
+        if currentScreenTab == 3 then goto continue end   -- 设备页暂停无妨，实际可一直运行
         local selId = selectedTargetId
         local sel = targets[selId]
         if not sel then
@@ -713,7 +715,7 @@ local function tmaLoop()
             local lastRecord = tmaData.times[#tmaData.times] or 0
             if now - lastRecord >= TMA_RECORD_INTERVAL and localPos then
                 local ownX = localPos.x
-                local ownY = -localPos.z
+                local ownY = -localPos.z   -- 转换为 Y 北
                 local bearing = sel.paintedYaw or 0
                 table.insert(tmaData.ownPositions, {x = ownX, y = ownY})
                 table.insert(tmaData.bearings, bearing)
@@ -724,6 +726,7 @@ local function tmaLoop()
             if #tmaData.times >= 2 and (tmaData.times[#tmaData.times] - tmaData.times[1] >= TMA_WINDOW) then
                 local sol = tmaSolve(tmaData)
                 if sol then
+                    -- 机动检测
                     if tmaData.solution and localPos then
                         local state = sol.state
                         local tNow = now - tmaData.times[1]
@@ -748,7 +751,7 @@ local function tmaLoop()
 end
 
 -- ==========================================
--- TMA HUD 绘制协程
+-- TMA HUD 绘制协程 (独立使用 tmaMonitor)
 -- ==========================================
 local function tmaHUDLoop()
     if not tmaMonitor then return end
@@ -952,7 +955,7 @@ local function rdrGpuUI()
     if #rdrGpuList==0 then return end
     local frames=0; local lastActive=false
     while true do
-        if currentScreenTab==2 then
+        if currentScreenTab==3 then   -- 设备页可以停刷新
             for _,entry in ipairs(rdrGpuList) do
                 pcall(function()
                     entry.gpu.fill(C.BG)
@@ -1003,7 +1006,7 @@ local function rdrGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环
+-- HUD 主循环 (主 HUD，跳过 TMA 监视器)
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList==0 then return end
@@ -1013,6 +1016,8 @@ local function hudMonitorUI()
         local isFirstFrame=(frames<=2)
         local isActive=(currentRadarRange>0) and isServoConnected
         for _,info in ipairs(hudMonitorList) do
+            -- 跳过 TMA 监视器
+            if info.m == tmaMonitor then goto continueHUD end
             if info.mode=="STATUS" then
                 local sText,sColor = "GHG hydrophone", colors.green
                 local rText,rColor = "", colors.lime
@@ -1069,103 +1074,134 @@ local function hudMonitorUI()
                     info.lastLText=lText; info.lastSpeedText=speedText
                 end
             end
+            ::continueHUD::
         end
         sleep(0.1)
     end
 end
 
 -- ==========================================
--- 终端 UI (恢复 System Status 并保留 TMA 参数)
+-- 终端 UI (三页)
 -- ==========================================
 local function termUI()
     while true do
         term.setBackgroundColor(colors.black)
         term.clear()
-        if currentScreenTab==2 then
-            term.setCursorPos(2,2); term.setTextColor(colors.lightGray)
-            term.write("=== CONNECTED DISPLAYS ===")
-            local r=4
-            -- ... (同前，略)
-        else
-            term.setCursorPos(2,2); term.setTextColor(colors.yellow)
-            term.write("=== HYDROPHONE CONFIG ===")
+        local w, h = term.getSize()
 
+        -- 顶部标签栏
+        local tabs = {"CONFIG", "STATUS", "DEVICES"}
+        local tabStr = ""
+        for i, t in ipairs(tabs) do
+            tabStr = tabStr .. (i == currentScreenTab and ("["..t.."]") or " "..t.." ") .. "  "
+        end
+        term.setCursorPos(2,1); term.setTextColor(colors.white)
+        term.write("TAB " .. tabStr)
+
+        -- ===== 第一页：配置参数 =====
+        if currentScreenTab == 1 then
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
+            term.write("=== PARAMETERS ===")
             local function drawInputBox(y, label, val, isSel, isEdit)
                 term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
                 term.setTextColor(isSel and colors.yellow or colors.lightGray)
                 term.write(label)
-                term.setCursorPos(15,y); term.setBackgroundColor(colors.gray)
-                local txt=(isSel and isEdit) and (inputStr.."_") or tostring(val)
+                term.setCursorPos(17,y); term.setBackgroundColor(colors.gray)
+                local txt = (isSel and isEdit) and (inputStr.."_") or tostring(val)
                 term.setTextColor(isSel and colors.white or colors.lightGray)
                 term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
+            drawInputBox(5,  "Disp. Offset :", yawOffset,    menuIndex==1, isEditing)
+            drawInputBox(7,  "Motor Offset :", motorOffset,  menuIndex==2, isEditing)
+            drawInputBox(9,  "Aim Precis   :", aimPrecision, menuIndex==3, isEditing)
+            drawInputBox(11, "TMA Window   :", TMA_WINDOW,   menuIndex==4, isEditing)
+            drawInputBox(13, "TMA Interval :", TMA_MANEUVER_INTERVAL, menuIndex==5, isEditing)
+            drawInputBox(15, "TMA Angle    :", TMA_TURN_ANGLE, menuIndex==6, isEditing)
 
-            drawInputBox(4,  "Disp. Offset:", yawOffset,    menuIndex==1, isEditing)
-            drawInputBox(6,  "Motor Offset:", motorOffset,  menuIndex==2, isEditing)
-            drawInputBox(8,  "Aim Precis  :", aimPrecision, menuIndex==3, isEditing)
-            drawInputBox(10, "TMA Window  :", TMA_WINDOW,  menuIndex==4, isEditing)
-            drawInputBox(12, "TMA Interval:", TMA_MANEUVER_INTERVAL, menuIndex==5, isEditing)
-            drawInputBox(14, "TMA Angle   :", TMA_TURN_ANGLE, menuIndex==6, isEditing)
-
-            term.setCursorPos(2,16); term.setTextColor(colors.yellow)
+        -- ===== 第二页：系统状态 =====
+        elseif currentScreenTab == 2 then
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== SYSTEM STATUS ===")
-
-            term.setCursorPos(2,18); term.setTextColor(colors.lime)
-            term.write(string.format("Registered : %s", myLabel))
-
-            term.setCursorPos(2,19); term.setTextColor(colors.cyan)
-            term.write(string.format("Max Range  : %.0f m", MAX_DISTANCE_LIMIT))
-
-            term.setCursorPos(2,20); term.setTextColor(colors.lightGray)
-            term.write(string.format("SU Ratio   : %g SU/m", STRESS_TO_DISTANCE_RATIO))
-
-            term.setCursorPos(2,21); term.setTextColor(colors.green)
-            term.write("Camera     : ONLINE")
-
-            term.setCursorPos(2,22)
+            local row = 5
+            term.setCursorPos(2,row); term.setTextColor(colors.lime)
+            term.write("Registered : " .. myLabel); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write(string.format("Max Range  : %.0f m", MAX_DISTANCE_LIMIT)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
+            term.write(string.format("SU Ratio   : %g SU/m", STRESS_TO_DISTANCE_RATIO)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.green)
+            term.write("Camera     : ONLINE"); row = row+1
+            row = row+1
             if isServoConnected then
-                term.setTextColor(colors.white)
-                term.write(string.format("Motor Angle: %6.1f deg", currentServoAngle))
+                term.setCursorPos(2,row); term.setTextColor(colors.white)
+                term.write(string.format("Motor Angle: %6.1f deg", currentServoAngle)); row = row+1
             else
-                term.setTextColor(colors.red); term.write("Motor Angle: OFFLINE")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Motor Angle: OFFLINE"); row = row+1
             end
-
-            term.setCursorPos(2,23)
             if currentRadarRange==0 then
-                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Power!)")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Op. Range  : 0.0 (No Power!)"); row = row+1
             elseif not isServoConnected then
-                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Motor!)")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Op. Range  : 0.0 (No Motor!)"); row = row+1
             else
-                term.setTextColor(colors.green)
-                term.write(string.format("Op. Range  : %.1f m", currentRadarRange))
+                term.setCursorPos(2,row); term.setTextColor(colors.green)
+                term.write(string.format("Op. Range  : %.1f m", currentRadarRange)); row = row+1
             end
+            term.setCursorPos(2,row); term.setTextColor(colors.gray)
+            term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.gray)
+            term.write(string.format("Aim grid   : %d deg/step", aimPrecision)); row = row+1
+            local beaconCount = 0
+            for _, d in pairs(targets) do if d.isBeacon then beaconCount = beaconCount+1 end end
+            term.setCursorPos(2,row); term.setTextColor(colors.yellow)
+            term.write(string.format("Beacons    : %d online", beaconCount)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
+            term.write(string.format("TPS (est.) : %.1f", tpsEstimate))
 
-            term.setCursorPos(2,24); term.setTextColor(colors.gray)
-            term.write("[TAB] Monitor")
-
-            term.setCursorPos(2,25); term.setTextColor(colors.cyan)
-            term.write((#rdrGpuList>0)
-                and ("RDR GPU: "..(#rdrGpuList).." online")
-                or  "RDR GPU: NONE")
-
-            term.setCursorPos(2,26); term.setTextColor(colors.gray)
-            term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg))
-
-            term.setCursorPos(2,27); term.setTextColor(colors.gray)
-            term.write(string.format("Aim grid   : %d deg/step", aimPrecision))
-
-            local beaconCount=0
-            for _,d in pairs(targets) do if d.isBeacon then beaconCount=beaconCount+1 end end
-            term.setCursorPos(2,28); term.setTextColor(colors.yellow)
-            term.write(string.format("Beacons    : %d online", beaconCount))
+        -- ===== 第三页：显示器列表 =====
+        else
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
+            term.write("=== DISPLAYS ===")
+            local row = 5
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("[RDR GPU]"); row = row+1
+            if #rdrGpuList == 0 then
+                term.setCursorPos(4,row); term.setTextColor(colors.red)
+                term.write("None"); row = row+1
+            else
+                for _, e in ipairs(rdrGpuList) do
+                    term.setCursorPos(4,row); term.setTextColor(colors.lightBlue)
+                    term.write(e.name .. string.format("  [%dx%d]", e.w, e.h)); row = row+1
+                end
+            end
+            row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("[HUD Monitors]"); row = row+1
+            if #hudMonitorList == 0 then
+                term.setCursorPos(4,row); term.setTextColor(colors.red)
+                term.write("None"); row = row+1
+            else
+                for _, info in ipairs(hudMonitorList) do
+                    local role = (info.m == tmaMonitor) and " [TMA]" or ""
+                    term.setCursorPos(4,row); term.setTextColor(colors.lightBlue)
+                    term.write(info.displayName .. " (" .. info.name .. ")" .. role); row = row+1
+                end
+            end
+            if tmaMonitor then
+                term.setCursorPos(4,row); term.setTextColor(colors.yellow)
+                term.write("TMA display: attached")
+            end
         end
+
         sleep(0.2)
     end
 end
 
 -- ==========================================
--- 输入事件循环 (支持 TMA 参数编辑)
+-- 输入事件循环
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -1194,7 +1230,7 @@ local function inputLoop()
 
         if event=="key" then
             if p1==keys.tab then
-                currentScreenTab=(currentScreenTab==1) and 2 or 1
+                currentScreenTab = (currentScreenTab % 3) + 1
             elseif isEditing and currentScreenTab==1 then
                 if p1==keys.enter or p1==keys.numPadEnter then
                     applySave()
@@ -1223,12 +1259,12 @@ local function inputLoop()
             local touchY=p3
             if currentScreenTab==1 then
                 local ti=nil
-                if     touchY==4 then ti=1
-                elseif touchY==6 then ti=2
-                elseif touchY==8 then ti=3
-                elseif touchY==10 then ti=4
-                elseif touchY==12 then ti=5
-                elseif touchY==14 then ti=6
+                if     touchY==5 then ti=1
+                elseif touchY==7 then ti=2
+                elseif touchY==9 then ti=3
+                elseif touchY==11 then ti=4
+                elseif touchY==13 then ti=5
+                elseif touchY==15 then ti=6
                 end
                 if ti then
                     if isEditing and menuIndex~=ti then applySave() end
@@ -1244,7 +1280,7 @@ local function inputLoop()
                     if isEditing then applySave() end
                 end
             end
-        elseif (event=="tm_monitor_touch" or event=="tm_monitor_mouse_click") and currentScreenTab==1 then
+        elseif (event=="tm_monitor_touch" or event=="tm_monitor_mouse_click") and currentScreenTab<=2 then
             local touchedName=p1; local mx,my=p2,p3
             local entry=gpuNameMap[touchedName]
             if entry and localPos and currentRadarRange>0 and isServoConnected then
@@ -1289,11 +1325,11 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络 & 红石 & 测速 & 扫描 (完整实现)
+-- 网络 & 红石 & 测速 & 扫描
 -- ==========================================
 local function pingLoop()
     while true do
-        if currentScreenTab==2 then sleep(0.5)
+        if currentScreenTab==3 then sleep(0.5)
         else
             if localPos then
                 local msg = {
@@ -1385,22 +1421,38 @@ local function speedTimerLoop()
     while true do
         local event, timerId = os_pullEvent("timer")
         if event == "timer" and timerId == speedTimer then
-            local now = os_clock()
+            local nowClock = os_clock()
+            local nowEpoch = os.epoch("utc")
+            -- 估算 TPS
+            if lastEpoch > 0 and lastClock > 0 then
+                local gameDelta = nowClock - lastClock
+                local realDelta = (nowEpoch - lastEpoch) / 1000.0
+                if realDelta > 0.001 and gameDelta > 0 then
+                    tpsEstimate = 20.0 * gameDelta / realDelta
+                else
+                    tpsEstimate = 20.0
+                end
+            end
+            lastClock, lastEpoch = nowClock, nowEpoch
+
+            local tpsFactor = tpsEstimate / 20.0   -- 服务器慢时 tpsFactor < 1
+
             for id, data in pairs(targets) do
                 if data.realPos and data.lastPos and data.lastTime then
-                    local dt = now - data.lastTime
+                    local dt = nowClock - data.lastTime
                     if dt > 0.5 then
                         local dx = data.realPos.x - data.lastPos.x
                         local dy = data.realPos.y - data.lastPos.y
                         local dz = data.realPos.z - data.lastPos.z
                         local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        data.speed = dist / dt  -- m/s
+                        -- 测出的原始速度是 游戏刻度 下的速度，校正为真实时间速度
+                        data.speed = (dist / dt) * tpsFactor   -- m/s (真实)
 
                         if data.realDist and data.realDist > 0.01 and localPos then
                             local relX = data.realPos.x - localPos.x
                             local relY = data.realPos.y - localPos.y
                             local relZ = data.realPos.z - localPos.z
-                            data.radialSpeed = (dx*relX + dy*relY + dz*relZ) / (data.realDist * dt)
+                            data.radialSpeed = ((dx*relX + dy*relY + dz*relZ) / (data.realDist * dt)) * tpsFactor
                         else
                             data.radialSpeed = 0
                         end
@@ -1408,7 +1460,7 @@ local function speedTimerLoop()
                 end
                 if data.realPos then
                     data.lastPos = {x = data.realPos.x, y = data.realPos.y, z = data.realPos.z}
-                    data.lastTime = now
+                    data.lastTime = nowClock
                 end
             end
             speedTimer = os.startTimer(SPEED_INTERVAL)
@@ -1419,7 +1471,7 @@ end
 local function cameraLoop()
     local lastServoAngle=nil; local peripheralPollTick=0
     while true do
-        if currentScreenTab==2 then sleep(0.5)
+        if currentScreenTab==3 then sleep(0.5)
         else
             if peripheralPollTick<=0 then
                 peripheralPollTick=20
@@ -1611,7 +1663,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Hydrophone v2.1.0 - OK")
+print("GHG Hydrophone v2.2.0 - OK")
 print(string.format("  Name      : %s  [fixed]", myLabel))
 print(string.format("  Max Range : %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
