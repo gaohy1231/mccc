@@ -1,10 +1,6 @@
 --[[
-GHG Hydrophone + TMA 被动声纳距离解算器   v2.2.0
-改进：
-- 终端 UI 三页 (配置参数 / 系统状态 / 显示器列表)
-- TMA 专用 HUD (第二个监视器) 独立绘制
-- 速度测量补偿服务器 TPS (基于 os.epoch)
-- 保留所有水听器原有功能 (方向线、RWR、测速过滤等)
+GHG Hydrophone + TMA 被动声纳距离解算器   v2.2.1
+修正：相对本船方位角基于船首航向 (currentNorthYawDeg) 而非天线指向
 ======================================================================]]
 
 -- ==========================================
@@ -129,8 +125,8 @@ local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
-local currentNorthYawDeg    = 0
-local currentScreenTab      = 1   -- 1=配置, 2=状态, 3=设备
+local currentNorthYawDeg    = 0      -- 船首真实航向 (摄像头指向)
+local currentScreenTab      = 1      -- 1=配置, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
@@ -266,7 +262,6 @@ for _, name in ipairs(peripheral.getNames()) do
             lastLText   = nil, lastSpeedText = nil,
         }
         table.insert(hudMonitorList, entry)
-        -- 第二个监视器自动分配给 TMA
         if mIndex == 2 and not tmaMonitor then
             tmaMonitor = m
         end
@@ -320,7 +315,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Hydrophone v2.2.0 - Registration Check")
+    print("Hydrophone v2.2.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -468,10 +463,10 @@ print("Registration OK. Starting hydrophone...")
 sleep(0.5)
 
 -- ==========================================
--- TMA 核心算法
+-- TMA 核心算法 (不变)
 -- ==========================================
 local function tmaSolve(tma)
-    local own = tma.ownPositions   -- {{x, y}, ...}
+    local own = tma.ownPositions
     local B = tma.bearings
     local T = tma.times
     local knownSpeed = tma.knownSpeed
@@ -666,13 +661,13 @@ local function calcAOB(ownHdg, tgtHdg)
 end
 
 -- ==========================================
--- TMA 数据收集与解算协程
+-- TMA 数据收集与解算协程 (不变)
 -- ==========================================
 local function tmaLoop()
     while true do
         sleep(0.5)
         local now = os_clock()
-        if currentScreenTab == 3 then goto continue end   -- 设备页暂停无妨，实际可一直运行
+        if currentScreenTab == 3 then goto continue end
         local selId = selectedTargetId
         local sel = targets[selId]
         if not sel then
@@ -697,7 +692,6 @@ local function tmaLoop()
             }
         end
 
-        -- 测速稳定检测
         if not tmaData.startTime then
             if sel.speed and sel.radialSpeed then
                 if not tmaData._stableSince then
@@ -711,22 +705,19 @@ local function tmaLoop()
                 tmaData._stableSince = nil
             end
         else
-            -- 定期记录
             local lastRecord = tmaData.times[#tmaData.times] or 0
             if now - lastRecord >= TMA_RECORD_INTERVAL and localPos then
                 local ownX = localPos.x
-                local ownY = -localPos.z   -- 转换为 Y 北
+                local ownY = -localPos.z
                 local bearing = sel.paintedYaw or 0
                 table.insert(tmaData.ownPositions, {x = ownX, y = ownY})
                 table.insert(tmaData.bearings, bearing)
                 table.insert(tmaData.times, now)
             end
 
-            -- 检查窗口
             if #tmaData.times >= 2 and (tmaData.times[#tmaData.times] - tmaData.times[1] >= TMA_WINDOW) then
                 local sol = tmaSolve(tmaData)
                 if sol then
-                    -- 机动检测
                     if tmaData.solution and localPos then
                         local state = sol.state
                         local tNow = now - tmaData.times[1]
@@ -751,7 +742,7 @@ local function tmaLoop()
 end
 
 -- ==========================================
--- TMA HUD 绘制协程 (独立使用 tmaMonitor)
+-- TMA HUD 绘制协程 (不变)
 -- ==========================================
 local function tmaHUDLoop()
     if not tmaMonitor then return end
@@ -764,7 +755,6 @@ local function tmaHUDLoop()
 
         tmaMonitor.setBackgroundColor(colors.black)
         tmaMonitor.clear()
-        local dw, dh = tmaMonitor.getSize()
         local y = 1
 
         tmaMonitor.setTextColor(colors.cyan)
@@ -805,7 +795,7 @@ local function tmaHUDLoop()
         tmaMonitor.setTextColor(colors.magenta)
         tmaMonitor.setCursorPos(1, y)
         if tmaData and tmaData.solution and selectedTargetId then
-            local aob = calcAOB(currentServoAngle, tmaData.solution.heading)
+            local aob = calcAOB(currentNorthYawDeg, tmaData.solution.heading)
             local side = aob >= 0 and "Stbd" or "Port"
             tmaMonitor.write(string.format("AOB: %+d deg (%s)", math_floor(aob), side))
         else
@@ -817,7 +807,7 @@ local function tmaHUDLoop()
 end
 
 -- ==========================================
--- GPU 绘制
+-- GPU 绘制 (相对方位角改用船首航向)
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -949,13 +939,13 @@ local function gpuRefreshRadar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- RDR GPU 主循环
+-- RDR GPU 主循环 (相对方位用 currentNorthYawDeg)
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
     local frames=0; local lastActive=false
     while true do
-        if currentScreenTab==3 then   -- 设备页可以停刷新
+        if currentScreenTab==3 then
             for _,entry in ipairs(rdrGpuList) do
                 pcall(function()
                     entry.gpu.fill(C.BG)
@@ -985,7 +975,8 @@ local function rdrGpuUI()
                                 t.col = col
                                 t.s = math_sin(yawRad)
                                 t.cs = math_cos(yawRad)
-                                local relAngle = math_floor((data.paintedYaw - currentServoAngle) % 360 + 0.5) % 360
+                                -- [修正] 使用船首航向 currentNorthYawDeg 计算相对本船方位角
+                                local relAngle = math_floor((data.paintedYaw - currentNorthYawDeg) % 360 + 0.5) % 360
                                 t.relAngle = relAngle
                             end
                         end
@@ -1006,7 +997,7 @@ local function rdrGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环 (主 HUD，跳过 TMA 监视器)
+-- HUD 主循环 (相对方位用 currentNorthYawDeg)
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList==0 then return end
@@ -1016,7 +1007,6 @@ local function hudMonitorUI()
         local isFirstFrame=(frames<=2)
         local isActive=(currentRadarRange>0) and isServoConnected
         for _,info in ipairs(hudMonitorList) do
-            -- 跳过 TMA 监视器
             if info.m == tmaMonitor then goto continueHUD end
             if info.mode=="STATUS" then
                 local sText,sColor = "GHG hydrophone", colors.green
@@ -1029,7 +1019,8 @@ local function hudMonitorUI()
                     rColor = colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel = targets[selectedTargetId]
-                        local relBoat = math_floor((sel.paintedYaw or 0) - currentServoAngle + 0.5) % 360
+                        -- [修正] 相对本船方位角使用船首航向
+                        local relBoat = math_floor((sel.paintedYaw or 0) - currentNorthYawDeg + 0.5) % 360
                         local absWorld = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
                         lText = string.format("%.0f / %.0f", relBoat, absWorld)
                         lColor = colors.white
@@ -1081,7 +1072,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (三页)
+-- 终端 UI (三页，不变)
 -- ==========================================
 local function termUI()
     while true do
@@ -1089,7 +1080,6 @@ local function termUI()
         term.clear()
         local w, h = term.getSize()
 
-        -- 顶部标签栏
         local tabs = {"CONFIG", "STATUS", "DEVICES"}
         local tabStr = ""
         for i, t in ipairs(tabs) do
@@ -1098,7 +1088,6 @@ local function termUI()
         term.setCursorPos(2,1); term.setTextColor(colors.white)
         term.write("TAB " .. tabStr)
 
-        -- ===== 第一页：配置参数 =====
         if currentScreenTab == 1 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== PARAMETERS ===")
@@ -1119,7 +1108,6 @@ local function termUI()
             drawInputBox(13, "TMA Interval :", TMA_MANEUVER_INTERVAL, menuIndex==5, isEditing)
             drawInputBox(15, "TMA Angle    :", TMA_TURN_ANGLE, menuIndex==6, isEditing)
 
-        -- ===== 第二页：系统状态 =====
         elseif currentScreenTab == 2 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== SYSTEM STATUS ===")
@@ -1161,7 +1149,6 @@ local function termUI()
             term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
             term.write(string.format("TPS (est.) : %.1f", tpsEstimate))
 
-        -- ===== 第三页：显示器列表 =====
         else
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== DISPLAYS ===")
@@ -1201,7 +1188,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环
+-- 输入事件循环 (不变)
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -1325,7 +1312,7 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络 & 红石 & 测速 & 扫描
+-- 网络 & 红石 & 测速 & 扫描 (不变，已含 TPS 补偿)
 -- ==========================================
 local function pingLoop()
     while true do
@@ -1423,7 +1410,6 @@ local function speedTimerLoop()
         if event == "timer" and timerId == speedTimer then
             local nowClock = os_clock()
             local nowEpoch = os.epoch("utc")
-            -- 估算 TPS
             if lastEpoch > 0 and lastClock > 0 then
                 local gameDelta = nowClock - lastClock
                 local realDelta = (nowEpoch - lastEpoch) / 1000.0
@@ -1434,8 +1420,7 @@ local function speedTimerLoop()
                 end
             end
             lastClock, lastEpoch = nowClock, nowEpoch
-
-            local tpsFactor = tpsEstimate / 20.0   -- 服务器慢时 tpsFactor < 1
+            local tpsFactor = tpsEstimate / 20.0
 
             for id, data in pairs(targets) do
                 if data.realPos and data.lastPos and data.lastTime then
@@ -1445,8 +1430,7 @@ local function speedTimerLoop()
                         local dy = data.realPos.y - data.lastPos.y
                         local dz = data.realPos.z - data.lastPos.z
                         local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        -- 测出的原始速度是 游戏刻度 下的速度，校正为真实时间速度
-                        data.speed = (dist / dt) * tpsFactor   -- m/s (真实)
+                        data.speed = (dist / dt) * tpsFactor
 
                         if data.realDist and data.realDist > 0.01 and localPos then
                             local relX = data.realPos.x - localPos.x
@@ -1663,7 +1647,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Hydrophone v2.2.0 - OK")
+print("GHG Hydrophone v2.2.1 - OK")
 print(string.format("  Name      : %s  [fixed]", myLabel))
 print(string.format("  Max Range : %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
