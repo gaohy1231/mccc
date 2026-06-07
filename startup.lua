@@ -1,6 +1,9 @@
 --[[
-GHG Hydrophone + TMA 被动声纳距离解算器   v2.2.1
-修正：相对本船方位角基于船首航向 (currentNorthYawDeg) 而非天线指向
+GHG Hydrophone + 简单 TMA 两点解算   v2.3.0
+改动：
+- TMA 改为 50s/10s 两点法，锁定后循环，保留上次结果
+- TMA 显示器界面调整，删除机动提示，计数60s一次
+- 修正相对方位角（相对本船 = paintedYaw，相对世界 = paintedYaw + 航向）
 ======================================================================]]
 
 -- ==========================================
@@ -20,14 +23,9 @@ local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)
 
 local REG_QUERY_TIMEOUT = 5.0
 
--- TMA 配置
-local TMA_WINDOW            = 150.0
-local TMA_MANEUVER_INTERVAL = 60.0
-local TMA_TURN_ANGLE        = 30.0
-local TMA_STABILIZE_TIME    = 10.0
-local TMA_RECORD_INTERVAL   = 10.0
-local TMA_RESIDUAL_THRESHOLD = 8.0
-local TMA_MIN_POINTS        = 4
+-- 简单 TMA 配置
+local TMA_FIRST_WAIT  = 50.0  -- 第一次记录后等待时间 (秒)
+local TMA_SECOND_WAIT = 10.0  -- 第二次记录后等待时间 (秒)
 
 -- ==========================================
 -- 外设初始化
@@ -137,9 +135,10 @@ local targetPoolCount       = 0
 local rwrEvents             = {}
 local speedTimer            = nil
 
--- TMA 相关状态
+-- 简单 TMA 状态
 local tmaMonitor = nil
-local tmaData = nil
+local tmaData = nil   -- 存储测量结果和状态
+local tmaLastResult = nil  -- 上一次有效结果，用于持续显示
 
 -- TPS 估算
 local tpsEstimate = 20.0
@@ -165,9 +164,6 @@ local function loadConfig()
             if type(data.monitorModes) == "table" then
                 monitorModes = data.monitorModes
             end
-            if data.tmaWindow then TMA_WINDOW = tonumber(data.tmaWindow) or TMA_WINDOW end
-            if data.tmaInterval then TMA_MANEUVER_INTERVAL = tonumber(data.tmaInterval) or TMA_MANEUVER_INTERVAL end
-            if data.tmaAngle then TMA_TURN_ANGLE = tonumber(data.tmaAngle) or TMA_TURN_ANGLE end
         end
     end
 end
@@ -179,9 +175,6 @@ local function saveConfig()
         motorOffset  = motorOffset,
         aimPrecision = aimPrecision,
         monitorModes = monitorModes,
-        tmaWindow    = TMA_WINDOW,
-        tmaInterval  = TMA_MANEUVER_INTERVAL,
-        tmaAngle     = TMA_TURN_ANGLE,
     }))
     f.close()
 end
@@ -315,7 +308,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Hydrophone v2.2.1 - Registration Check")
+    print("Hydrophone v2.3.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -463,193 +456,31 @@ print("Registration OK. Starting hydrophone...")
 sleep(0.5)
 
 -- ==========================================
--- TMA 核心算法 (不变)
+-- 简单 TMA 两点解算逻辑
 -- ==========================================
-local function tmaSolve(tma)
-    local own = tma.ownPositions
-    local B = tma.bearings
-    local T = tma.times
-    local knownSpeed = tma.knownSpeed
-    local measuredRadial = tma.measuredRadial
-    local N = #B
-    if N < TMA_MIN_POINTS then return nil end
+local function simpleTMA(pos1, pos2, ownPos2, ownCourse)
+    -- pos1, pos2: 目标真实坐标 {x=, y=, z=}
+    -- ownPos2: 本艇在第二次记录时的位置 {x=, y=, z=}
+    -- ownCourse: 本艇航向 (度)
+    local dx = pos2.x - pos1.x
+    local dz = pos2.z - pos1.z
+    local dist = math_sqrt(dx*dx + dz*dz)
+    -- 航向（从 +Z 轴顺时针，适应 MC 坐标）
+    local heading = math_deg(math_atan2(dx, dz)) % 360
 
-    local Brad = {}
-    for _, v in ipairs(B) do table.insert(Brad, math_rad(v)) end
+    -- 速度 (km/h)，时间差为 TMA_SECOND_WAIT 秒（10秒）
+    local speed_ms = dist / TMA_SECOND_WAIT
+    local speed_kph = speed_ms * 3.6
 
-    local function residuals(state)
-        local x0, y0, phi = state[1], state[2], state[3]
-        local res = {}
-        for i = 1, N do
-            local t = T[i] - T[1]
-            local px = x0 + knownSpeed * math_sin(phi) * t
-            local py = y0 + knownSpeed * math_cos(phi) * t
-            local dX = px - own[i].x
-            local dY = py - own[i].y
-            local predBear = math_atan2(dX, dY)
-            local diff = (Brad[i] - predBear + math.pi) % (2*math.pi) - math.pi
-            table.insert(res, diff)
-        end
-        return res
-    end
+    -- 距离：第二次记录时目标到本艇的水平距离
+    local dx2 = pos2.x - ownPos2.x
+    local dz2 = pos2.z - ownPos2.z
+    local range = math_sqrt(dx2*dx2 + dz2*dz2)
 
-    local function cost(x0, y0, phi)
-        local r = residuals({x0, y0, phi})
-        local sum = 0
-        for _, v in ipairs(r) do sum = sum + v*v end
-        return sum
-    end
-
-    local ang0 = Brad[1]
-    local bestPhi, bestCost = 0, math.huge
-    local secondPhi, secondCost = 0, math.huge
-    for phi_deg = 0, 330, 30 do
-        local phi = math_rad(phi_deg)
-        local deltaBear = math_abs(getAngleDiff(B[1], B[N]))
-        local dt = T[N] - T[1]
-        local bearRate = math_rad(deltaBear) / (dt + 0.001)
-        local initDist = knownSpeed / (bearRate + 0.0001)
-        initDist = math_max(200, math_min(15000, initDist))
-        local x0 = own[1].x + initDist * math_sin(ang0)
-        local y0 = own[1].y + initDist * math_cos(ang0)
-        local c = cost(x0, y0, phi)
-        if c < bestCost then
-            secondPhi, secondCost = bestPhi, bestCost
-            bestPhi, bestCost = phi, c
-        elseif c < secondCost then
-            secondPhi, secondCost = phi, c
-        end
-    end
-
-    local function refine(phi0)
-        local state = {own[1].x + 2000*math_sin(ang0), own[1].y + 2000*math_cos(ang0), phi0}
-        local lambda = 0.01
-        local nu = 2.0
-        for _ = 1, 25 do
-            local r = residuals(state)
-            local sumSq = 0
-            for _, v in ipairs(r) do sumSq = sumSq + v*v end
-
-            local J = {}
-            local eps = 0.1
-            for i = 1, N do
-                local row = {}
-                for k = 1, 3 do
-                    local old = state[k]
-                    state[k] = old + eps
-                    local r_new = residuals(state)
-                    row[k] = (r_new[i] - r[i]) / eps
-                    state[k] = old
-                end
-                table.insert(J, row)
-            end
-
-            local A = {{0,0,0},{0,0,0},{0,0,0}}
-            local b = {0,0,0}
-            for i = 1, N do
-                for a = 1, 3 do
-                    b[a] = b[a] + J[i][a] * r[i]
-                    for c = 1, 3 do
-                        A[a][c] = A[a][c] + J[i][a] * J[i][c]
-                    end
-                end
-            end
-            for a = 1, 3 do
-                A[a][a] = A[a][a] + lambda
-                b[a] = -b[a]
-            end
-
-            local function solve3x3(A, b)
-                local det = A[1][1]*(A[2][2]*A[3][3]-A[2][3]*A[3][2]) -
-                            A[1][2]*(A[2][1]*A[3][3]-A[2][3]*A[3][1]) +
-                            A[1][3]*(A[2][1]*A[3][2]-A[2][2]*A[3][1])
-                if math.abs(det) < 1e-10 then return nil end
-                local inv = {{0,0,0},{0,0,0},{0,0,0}}
-                inv[1][1] = (A[2][2]*A[3][3]-A[2][3]*A[3][2]) / det
-                inv[1][2] = -(A[1][2]*A[3][3]-A[1][3]*A[3][2]) / det
-                inv[1][3] = (A[1][2]*A[2][3]-A[1][3]*A[2][2]) / det
-                inv[2][1] = -(A[2][1]*A[3][3]-A[2][3]*A[3][1]) / det
-                inv[2][2] = (A[1][1]*A[3][3]-A[1][3]*A[3][1]) / det
-                inv[2][3] = -(A[1][1]*A[2][3]-A[1][3]*A[2][1]) / det
-                inv[3][1] = (A[2][1]*A[3][2]-A[2][2]*A[3][1]) / det
-                inv[3][2] = -(A[1][1]*A[3][2]-A[1][2]*A[3][1]) / det
-                inv[3][3] = (A[1][1]*A[2][2]-A[1][2]*A[2][1]) / det
-                local delta = {0,0,0}
-                for i = 1, 3 do
-                    for j = 1, 3 do
-                        delta[i] = delta[i] + inv[i][j] * b[j]
-                    end
-                end
-                return delta
-            end
-
-            local delta = solve3x3(A, b)
-            if not delta then break end
-
-            local newState = {state[1]+delta[1], state[2]+delta[2], state[3]+delta[3]}
-            local rNew = residuals(newState)
-            local sumSqNew = 0
-            for _, v in ipairs(rNew) do sumSqNew = sumSqNew + v*v end
-
-            local actualRed = sumSq - sumSqNew
-            local predictedRed = 0
-            for a = 1, 3 do
-                predictedRed = predictedRed + delta[a] * (lambda*delta[a] - b[a])
-            end
-            local ratio = 0
-            if predictedRed ~= 0 then ratio = actualRed / predictedRed end
-
-            if ratio > 0 then
-                state = newState
-                lambda = lambda * math_max(1/3, 1 - (2*ratio - 1)^3)
-                nu = 2.0
-            else
-                lambda = lambda * nu
-                nu = nu * 2
-            end
-            if sumSq < 1e-8 then break end
-        end
-        return state
-    end
-
-    local sol1 = refine(bestPhi)
-    local sol2 = nil
-    if secondCost < bestCost * 1.5 and math.abs(math.deg(bestPhi - secondPhi)) > 120 then
-        sol2 = refine(secondPhi)
-    end
-
-    local function selectByRadial(sol)
-        if not sol then return false end
-        local tNow = T[N] - T[1]
-        local curX = sol[1] + knownSpeed * math_sin(sol[3]) * tNow
-        local curY = sol[2] + knownSpeed * math_cos(sol[3]) * tNow
-        local dX = curX - own[N].x
-        local dY = curY - own[N].y
-        local dist = math_sqrt(dX*dX + dY*dY)
-        if dist < 0.01 then return false end
-        local proj = (knownSpeed * math_sin(sol[3]) * dX + knownSpeed * math_cos(sol[3]) * dY) / dist
-        return (proj > 0 and measuredRadial > 0) or (proj < 0 and measuredRadial < 0) or math_abs(proj) < 0.1
-    end
-
-    local chosen = sol1
-    if not selectByRadial(sol1) and sol2 and selectByRadial(sol2) then
-        chosen = sol2
-    end
-
-    local tNow = T[N] - T[1]
-    local curX = chosen[1] + knownSpeed * math_sin(chosen[3]) * tNow
-    local curY = chosen[2] + knownSpeed * math_cos(chosen[3]) * tNow
-    local dX = curX - own[N].x
-    local dY = curY - own[N].y
-    local dist = math_sqrt(dX*dX + dY*dY)
-    local heading = math_deg(chosen[3]) % 360
-    return { dist = dist, speed = knownSpeed, heading = heading, state = chosen }
-end
-
-local function calcAOB(ownHdg, tgtHdg)
-    ownHdg = ownHdg % 360
-    tgtHdg = tgtHdg % 360
-    local aob
+    -- AOB 计算
+    local aob = 0
+    local ownHdg = ownCourse % 360
+    local tgtHdg = heading % 360
     if ownHdg > tgtHdg then
         aob = ownHdg - tgtHdg - 180
     else
@@ -657,83 +488,93 @@ local function calcAOB(ownHdg, tgtHdg)
     end
     if aob > 180 then aob = aob - 360 end
     if aob < -180 then aob = aob + 360 end
-    return aob
+
+    return {
+        heading = heading,
+        speed = speed_kph,
+        range = range,
+        aob = aob
+    }
 end
 
 -- ==========================================
--- TMA 数据收集与解算协程 (不变)
+-- TMA 循环（两点法）
 -- ==========================================
 local function tmaLoop()
     while true do
         sleep(0.5)
         local now = os_clock()
-        if currentScreenTab == 3 then goto continue end
         local selId = selectedTargetId
         local sel = targets[selId]
+
+        -- 无锁定目标时清空状态
         if not sel then
             tmaData = nil
+            tmaLastResult = nil
             goto continue
         end
 
-        if tmaData and tmaData.targetId ~= selId then
-            tmaData = nil
-        end
-
-        if not tmaData then
+        -- 初始化测量状态
+        if not tmaData or tmaData.targetId ~= selId then
             tmaData = {
                 targetId = selId,
-                ownPositions = {},
-                bearings = {},
-                times = {},
-                startTime = nil,
-                knownSpeed = nil,
-                measuredRadial = nil,
-                solution = nil,
+                phase = "wait_first",  -- wait_first / wait_second / done
+                firstPos = nil,
+                secondPos = nil,
+                firstTime = 0,
+                secondTime = 0,
+                startTime = os_clock(),
+                measurementCount = 0
             }
         end
 
-        if not tmaData.startTime then
-            if sel.speed and sel.radialSpeed then
-                if not tmaData._stableSince then
-                    tmaData._stableSince = now
-                elseif now - tmaData._stableSince >= TMA_STABILIZE_TIME then
-                    tmaData.startTime = now
-                    tmaData.knownSpeed = sel.speed
-                    tmaData.measuredRadial = sel.radialSpeed
+        -- 第一阶段：等待第一次记录（50秒）
+        if tmaData.phase == "wait_first" then
+            if now - tmaData.startTime >= TMA_FIRST_WAIT then
+                -- 记录目标坐标（真实坐标，来自网络）
+                if sel.realPos then
+                    tmaData.firstPos = {x=sel.realPos.x, y=sel.realPos.y, z=sel.realPos.z}
+                    tmaData.firstTime = now
+                    tmaData.phase = "wait_second"
+                    tmaData.startTime = now  -- 重新计时
+                else
+                    -- 没有坐标，重置
+                    tmaData = nil
                 end
-            else
-                tmaData._stableSince = nil
-            end
-        else
-            local lastRecord = tmaData.times[#tmaData.times] or 0
-            if now - lastRecord >= TMA_RECORD_INTERVAL and localPos then
-                local ownX = localPos.x
-                local ownY = -localPos.z
-                local bearing = sel.paintedYaw or 0
-                table.insert(tmaData.ownPositions, {x = ownX, y = ownY})
-                table.insert(tmaData.bearings, bearing)
-                table.insert(tmaData.times, now)
             end
 
-            if #tmaData.times >= 2 and (tmaData.times[#tmaData.times] - tmaData.times[1] >= TMA_WINDOW) then
-                local sol = tmaSolve(tmaData)
-                if sol then
-                    if tmaData.solution and localPos then
-                        local state = sol.state
-                        local tNow = now - tmaData.times[1]
-                        local predX = state[1] + tmaData.knownSpeed * math_sin(state[3]) * tNow
-                        local predY = state[2] + tmaData.knownSpeed * math_cos(state[3]) * tNow
-                        local dX = predX - localPos.x
-                        local dY = predY - (-localPos.z)
-                        local predBearing = math_deg(math_atan2(dX, dY)) % 360
-                        local diff = math_abs(getAngleDiff(sel.paintedYaw or 0, predBearing))
-                        if diff > TMA_RESIDUAL_THRESHOLD then
-                            tmaData = nil
-                            goto continue
-                        end
+        -- 第二阶段：等待第二次记录（10秒）
+        elseif tmaData.phase == "wait_second" then
+            if now - tmaData.startTime >= TMA_SECOND_WAIT then
+                if sel.realPos then
+                    tmaData.secondPos = {x=sel.realPos.x, y=sel.realPos.y, z=sel.realPos.z}
+                    tmaData.secondTime = now
+                    -- 进行计算
+                    if tmaData.firstPos and tmaData.secondPos and localPos then
+                        local result = simpleTMA(
+                            tmaData.firstPos,
+                            tmaData.secondPos,
+                            localPos,
+                            currentNorthYawDeg
+                        )
+                        tmaLastResult = result
+                        tmaData.measurementCount = tmaData.measurementCount + 1
                     end
-                    tmaData.solution = sol
+                    tmaData.phase = "done"
+                    tmaData.startTime = now
+                else
+                    tmaData = nil
                 end
+            end
+
+        -- 测量完成后，等待下一次循环（重置到第一阶段）
+        elseif tmaData.phase == "done" then
+            -- 保留上次结果，等待一段时间再开始新测量（避免连续触发）
+            if now - tmaData.startTime >= 1.0 then  -- 1秒后重置
+                tmaData.phase = "wait_first"
+                tmaData.startTime = now
+                tmaData.firstPos = nil
+                tmaData.secondPos = nil
             end
         end
 
@@ -742,7 +583,7 @@ local function tmaLoop()
 end
 
 -- ==========================================
--- TMA HUD 绘制协程 (不变)
+-- TMA HUD 绘制协程 (新布局)
 -- ==========================================
 local function tmaHUDLoop()
     if not tmaMonitor then return end
@@ -757,47 +598,45 @@ local function tmaHUDLoop()
         tmaMonitor.clear()
         local y = 1
 
+        -- 第一行：TMA 名称
         tmaMonitor.setTextColor(colors.cyan)
         tmaMonitor.setCursorPos(1, y); tmaMonitor.write("TMA Computer v1.0")
         y = y + 1
 
+        -- 第二行：运行时间 + 测量完成次数
         local elapsed = 0
         local pts = 0
-        if tmaData and tmaData.startTime then
-            elapsed = now - tmaData.startTime
-            pts = #tmaData.times
+        if tmaData then
+            elapsed = now - (tmaData.startTime or now)
+            pts = tmaData.measurementCount or 0
         end
         tmaMonitor.setTextColor(colors.white)
         tmaMonitor.setCursorPos(1, y)
-        tmaMonitor.write(string.format("Time: %d s  Pts: %d", math_floor(elapsed), pts))
+        tmaMonitor.write(string.format("Time: %d s  Meas: %d", math_floor(elapsed), pts))
         y = y + 1
 
-        tmaMonitor.setTextColor(colors.yellow)
-        tmaMonitor.setCursorPos(1, y)
-        if selectedTargetId then
-            tmaMonitor.write(string.format("Turn %d deg every %d s", TMA_TURN_ANGLE, TMA_MANEUVER_INTERVAL))
-        else
-            tmaMonitor.write("No target locked")
-        end
-        y = y + 1
-
+        -- 第三行：距离/速度/航向（使用上次结果或当前结果）
         tmaMonitor.setTextColor(colors.green)
         tmaMonitor.setCursorPos(1, y)
-        if tmaData and tmaData.solution then
-            local sol = tmaData.solution
+        local displayRes = tmaLastResult
+        -- 如果有刚计算出的结果，优先使用
+        if tmaData and tmaData.phase == "done" and tmaLastResult then
+            displayRes = tmaLastResult
+        end
+        if displayRes then
             tmaMonitor.write(string.format("Rng: %.0f m  Spd: %.1f km/h  Hdg: %.0f",
-                sol.dist, sol.speed * 3.6, sol.heading))
+                displayRes.range, displayRes.speed, displayRes.heading))
         else
             tmaMonitor.write("Rng: ---  Spd: ---  Hdg: ---")
         end
         y = y + 1
 
+        -- 第四行：AOB
         tmaMonitor.setTextColor(colors.magenta)
         tmaMonitor.setCursorPos(1, y)
-        if tmaData and tmaData.solution and selectedTargetId then
-            local aob = calcAOB(currentNorthYawDeg, tmaData.solution.heading)
-            local side = aob >= 0 and "Stbd" or "Port"
-            tmaMonitor.write(string.format("AOB: %+d deg (%s)", math_floor(aob), side))
+        if displayRes then
+            local side = displayRes.aob >= 0 and "Stbd" or "Port"
+            tmaMonitor.write(string.format("AOB: %+d deg (%s)", math_floor(displayRes.aob), side))
         else
             tmaMonitor.write("AOB: ---")
         end
@@ -807,7 +646,7 @@ local function tmaHUDLoop()
 end
 
 -- ==========================================
--- GPU 绘制 (相对方位角改用船首航向)
+-- GPU 绘制 (相对方位角使用 paintedYaw)
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -939,7 +778,7 @@ local function gpuRefreshRadar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- RDR GPU 主循环 (相对方位用 currentNorthYawDeg)
+-- RDR GPU 主循环 (相对方位 = paintedYaw)
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
@@ -975,8 +814,8 @@ local function rdrGpuUI()
                                 t.col = col
                                 t.s = math_sin(yawRad)
                                 t.cs = math_cos(yawRad)
-                                -- [修正] 使用船首航向 currentNorthYawDeg 计算相对本船方位角
-                                local relAngle = math_floor((data.paintedYaw - currentNorthYawDeg) % 360 + 0.5) % 360
+                                -- [修正] 相对本船方位角 = paintedYaw (0正前,90正右)
+                                local relAngle = math_floor((data.paintedYaw) % 360 + 0.5) % 360
                                 t.relAngle = relAngle
                             end
                         end
@@ -997,7 +836,7 @@ local function rdrGpuUI()
 end
 
 -- ==========================================
--- HUD 主循环 (相对方位用 currentNorthYawDeg)
+-- HUD 主循环 (相对方位 = paintedYaw)
 -- ==========================================
 local function hudMonitorUI()
     if #hudMonitorList==0 then return end
@@ -1019,9 +858,10 @@ local function hudMonitorUI()
                     rColor = colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel = targets[selectedTargetId]
-                        -- [修正] 相对本船方位角使用船首航向
-                        local relBoat = math_floor((sel.paintedYaw or 0) - currentNorthYawDeg + 0.5) % 360
-                        local absWorld = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
+                        -- 相对本船方位角 = paintedYaw
+                        local relBoat = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
+                        -- 相对世界方位角 = paintedYaw + 航向
+                        local absWorld = math_floor((sel.paintedYaw or 0) + currentNorthYawDeg + 0.5) % 360
                         lText = string.format("%.0f / %.0f", relBoat, absWorld)
                         lColor = colors.white
                         local radSpd = sel.radialSpeed or 0
@@ -1072,7 +912,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (三页，不变)
+-- 终端 UI (三页，保留 TMA 参数但不再使用机动相关，可留作备用)
 -- ==========================================
 local function termUI()
     while true do
@@ -1104,9 +944,6 @@ local function termUI()
             drawInputBox(5,  "Disp. Offset :", yawOffset,    menuIndex==1, isEditing)
             drawInputBox(7,  "Motor Offset :", motorOffset,  menuIndex==2, isEditing)
             drawInputBox(9,  "Aim Precis   :", aimPrecision, menuIndex==3, isEditing)
-            drawInputBox(11, "TMA Window   :", TMA_WINDOW,   menuIndex==4, isEditing)
-            drawInputBox(13, "TMA Interval :", TMA_MANEUVER_INTERVAL, menuIndex==5, isEditing)
-            drawInputBox(15, "TMA Angle    :", TMA_TURN_ANGLE, menuIndex==6, isEditing)
 
         elseif currentScreenTab == 2 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
@@ -1202,12 +1039,6 @@ local function inputLoop()
                 p=math_floor(math_abs(p))
                 if p>=1 and p<=90 and (360%p==0) then aimPrecision=p end
             end
-        elseif menuIndex==4 then
-            local p=tonumber(inputStr); if p and p>0 then TMA_WINDOW = p end
-        elseif menuIndex==5 then
-            local p=tonumber(inputStr); if p and p>0 then TMA_MANEUVER_INTERVAL = p end
-        elseif menuIndex==6 then
-            local p=tonumber(inputStr); if p and p>0 then TMA_TURN_ANGLE = p end
         end
         saveConfig(); isEditing=false
     end
@@ -1226,15 +1057,12 @@ local function inputLoop()
                 end
             elseif currentScreenTab==1 then
                 if     p1==keys.up   then menuIndex=math_max(1,menuIndex-1)
-                elseif p1==keys.down then menuIndex=math_min(6,menuIndex+1)
+                elseif p1==keys.down then menuIndex=math_min(3,menuIndex+1)
                 elseif p1==keys.enter or p1==keys.numPadEnter then
                     isEditing=true
                     if     menuIndex==1 then inputStr=tostring(yawOffset)
                     elseif menuIndex==2 then inputStr=tostring(motorOffset)
                     elseif menuIndex==3 then inputStr=tostring(aimPrecision)
-                    elseif menuIndex==4 then inputStr=tostring(TMA_WINDOW)
-                    elseif menuIndex==5 then inputStr=tostring(TMA_MANEUVER_INTERVAL)
-                    elseif menuIndex==6 then inputStr=tostring(TMA_TURN_ANGLE)
                     end
                 end
             end
@@ -1249,9 +1077,6 @@ local function inputLoop()
                 if     touchY==5 then ti=1
                 elseif touchY==7 then ti=2
                 elseif touchY==9 then ti=3
-                elseif touchY==11 then ti=4
-                elseif touchY==13 then ti=5
-                elseif touchY==15 then ti=6
                 end
                 if ti then
                     if isEditing and menuIndex~=ti then applySave() end
@@ -1259,9 +1084,6 @@ local function inputLoop()
                     if     menuIndex==1 then inputStr=tostring(yawOffset)
                     elseif menuIndex==2 then inputStr=tostring(motorOffset)
                     elseif menuIndex==3 then inputStr=tostring(aimPrecision)
-                    elseif menuIndex==4 then inputStr=tostring(TMA_WINDOW)
-                    elseif menuIndex==5 then inputStr=tostring(TMA_MANEUVER_INTERVAL)
-                    elseif menuIndex==6 then inputStr=tostring(TMA_TURN_ANGLE)
                     end
                 else
                     if isEditing then applySave() end
@@ -1312,7 +1134,7 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络 & 红石 & 测速 & 扫描 (不变，已含 TPS 补偿)
+-- 网络 & 红石 & 测速 & 扫描 (保留)
 -- ==========================================
 local function pingLoop()
     while true do
@@ -1647,7 +1469,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Hydrophone v2.2.1 - OK")
+print("GHG Hydrophone v2.3.0 - OK")
 print(string.format("  Name      : %s  [fixed]", myLabel))
 print(string.format("  Max Range : %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
