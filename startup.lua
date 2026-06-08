@@ -1,9 +1,10 @@
---[[
-GHG Hydrophone + 简单 TMA 两点解算   v2.3.0
+ --[[
+GHG Hydrophone + 简单 TMA + 多频道通信   v2.4.0
+======================================================================
 改动：
-- TMA 改为 50s/10s 两点法，锁定后循环，保留上次结果
-- TMA 显示器界面调整，删除机动提示，计数60s一次
-- 修正相对方位角（相对本船 = paintedYaw，相对世界 = paintedYaw + 航向）
+- TMA 简化为 50s/10s 两点法，TMA 显示器新布局
+- 修正相对方位角 (相对本船 = paintedYaw, 相对世界 = paintedYaw+航向)
+- 多频道通信：8888 为原有频道，8889 用于主动声纳，广播真实坐标并响应类型3 RWR
 ======================================================================]]
 
 -- ==========================================
@@ -11,7 +12,8 @@ GHG Hydrophone + 简单 TMA 两点解算   v2.3.0
 -- ==========================================
 local MAX_DISTANCE_LIMIT       = 5000.0
 local STRESS_TO_DISTANCE_RATIO = 2.0
-local CHANNEL                  = 8888
+local CHANNEL                  = 8888          -- 原有频道 (水听/雷达网络)
+local ACTIVE_SONAR_CHANNEL     = 8889          -- 主动声纳频道
 local SCAN_SECTOR_WIDTH        = 20
 local SEA_LEVEL                = -4
 
@@ -24,8 +26,8 @@ local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)
 local REG_QUERY_TIMEOUT = 5.0
 
 -- 简单 TMA 配置
-local TMA_FIRST_WAIT  = 50.0  -- 第一次记录后等待时间 (秒)
-local TMA_SECOND_WAIT = 10.0  -- 第二次记录后等待时间 (秒)
+local TMA_FIRST_WAIT  = 50.0  -- 第一次记录等待时间 (秒)
+local TMA_SECOND_WAIT = 10.0  -- 第二次记录等待时间 (秒)
 
 -- ==========================================
 -- 外设初始化
@@ -33,6 +35,7 @@ local TMA_SECOND_WAIT = 10.0  -- 第二次记录后等待时间 (秒)
 local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
 if not modem then error("Wireless or Ender Modem not found!", 0) end
 modem.open(CHANNEL)
+modem.open(ACTIVE_SONAR_CHANNEL)    -- 打开主动声纳频道
 
 local camera, cameraName = nil, nil
 for _, name in ipairs(peripheral.getNames()) do
@@ -137,8 +140,8 @@ local speedTimer            = nil
 
 -- 简单 TMA 状态
 local tmaMonitor = nil
-local tmaData = nil   -- 存储测量结果和状态
-local tmaLastResult = nil  -- 上一次有效结果，用于持续显示
+local tmaData = nil
+local tmaLastResult = nil
 
 -- TPS 估算
 local tpsEstimate = 20.0
@@ -308,7 +311,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Hydrophone v2.3.0 - Registration Check")
+    print("Hydrophone v2.4.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -459,25 +462,17 @@ sleep(0.5)
 -- 简单 TMA 两点解算逻辑
 -- ==========================================
 local function simpleTMA(pos1, pos2, ownPos2, ownCourse)
-    -- pos1, pos2: 目标真实坐标 {x=, y=, z=}
-    -- ownPos2: 本艇在第二次记录时的位置 {x=, y=, z=}
-    -- ownCourse: 本艇航向 (度)
     local dx = pos2.x - pos1.x
     local dz = pos2.z - pos1.z
     local dist = math_sqrt(dx*dx + dz*dz)
-    -- 航向（从 +Z 轴顺时针，适应 MC 坐标）
     local heading = math_deg(math_atan2(dx, dz)) % 360
-
-    -- 速度 (km/h)，时间差为 TMA_SECOND_WAIT 秒（10秒）
     local speed_ms = dist / TMA_SECOND_WAIT
     local speed_kph = speed_ms * 3.6
 
-    -- 距离：第二次记录时目标到本艇的水平距离
     local dx2 = pos2.x - ownPos2.x
     local dz2 = pos2.z - ownPos2.z
     local range = math_sqrt(dx2*dx2 + dz2*dz2)
 
-    -- AOB 计算
     local aob = 0
     local ownHdg = ownCourse % 360
     local tgtHdg = heading % 360
@@ -489,12 +484,7 @@ local function simpleTMA(pos1, pos2, ownPos2, ownCourse)
     if aob > 180 then aob = aob - 360 end
     if aob < -180 then aob = aob + 360 end
 
-    return {
-        heading = heading,
-        speed = speed_kph,
-        range = range,
-        aob = aob
-    }
+    return { heading = heading, speed = speed_kph, range = range, aob = aob }
 end
 
 -- ==========================================
@@ -507,55 +497,44 @@ local function tmaLoop()
         local selId = selectedTargetId
         local sel = targets[selId]
 
-        -- 无锁定目标时清空状态
         if not sel then
             tmaData = nil
-            tmaLastResult = nil
             goto continue
         end
 
-        -- 初始化测量状态
         if not tmaData or tmaData.targetId ~= selId then
             tmaData = {
                 targetId = selId,
-                phase = "wait_first",  -- wait_first / wait_second / done
+                phase = "wait_first",
                 firstPos = nil,
                 secondPos = nil,
                 firstTime = 0,
                 secondTime = 0,
                 startTime = os_clock(),
-                measurementCount = 0
+                measurementCount = (tmaData and tmaData.measurementCount) or 0
             }
         end
 
-        -- 第一阶段：等待第一次记录（50秒）
         if tmaData.phase == "wait_first" then
             if now - tmaData.startTime >= TMA_FIRST_WAIT then
-                -- 记录目标坐标（真实坐标，来自网络）
                 if sel.realPos then
                     tmaData.firstPos = {x=sel.realPos.x, y=sel.realPos.y, z=sel.realPos.z}
                     tmaData.firstTime = now
                     tmaData.phase = "wait_second"
-                    tmaData.startTime = now  -- 重新计时
+                    tmaData.startTime = now
                 else
-                    -- 没有坐标，重置
                     tmaData = nil
                 end
             end
-
-        -- 第二阶段：等待第二次记录（10秒）
         elseif tmaData.phase == "wait_second" then
             if now - tmaData.startTime >= TMA_SECOND_WAIT then
                 if sel.realPos then
                     tmaData.secondPos = {x=sel.realPos.x, y=sel.realPos.y, z=sel.realPos.z}
                     tmaData.secondTime = now
-                    -- 进行计算
                     if tmaData.firstPos and tmaData.secondPos and localPos then
                         local result = simpleTMA(
-                            tmaData.firstPos,
-                            tmaData.secondPos,
-                            localPos,
-                            currentNorthYawDeg
+                            tmaData.firstPos, tmaData.secondPos,
+                            localPos, currentNorthYawDeg
                         )
                         tmaLastResult = result
                         tmaData.measurementCount = tmaData.measurementCount + 1
@@ -566,11 +545,8 @@ local function tmaLoop()
                     tmaData = nil
                 end
             end
-
-        -- 测量完成后，等待下一次循环（重置到第一阶段）
         elseif tmaData.phase == "done" then
-            -- 保留上次结果，等待一段时间再开始新测量（避免连续触发）
-            if now - tmaData.startTime >= 1.0 then  -- 1秒后重置
+            if now - tmaData.startTime >= 1.0 then
                 tmaData.phase = "wait_first"
                 tmaData.startTime = now
                 tmaData.firstPos = nil
@@ -598,12 +574,10 @@ local function tmaHUDLoop()
         tmaMonitor.clear()
         local y = 1
 
-        -- 第一行：TMA 名称
         tmaMonitor.setTextColor(colors.cyan)
         tmaMonitor.setCursorPos(1, y); tmaMonitor.write("TMA Computer v1.0")
         y = y + 1
 
-        -- 第二行：运行时间 + 测量完成次数
         local elapsed = 0
         local pts = 0
         if tmaData then
@@ -615,11 +589,9 @@ local function tmaHUDLoop()
         tmaMonitor.write(string.format("Time: %d s  Meas: %d", math_floor(elapsed), pts))
         y = y + 1
 
-        -- 第三行：距离/速度/航向（使用上次结果或当前结果）
         tmaMonitor.setTextColor(colors.green)
         tmaMonitor.setCursorPos(1, y)
         local displayRes = tmaLastResult
-        -- 如果有刚计算出的结果，优先使用
         if tmaData and tmaData.phase == "done" and tmaLastResult then
             displayRes = tmaLastResult
         end
@@ -631,7 +603,6 @@ local function tmaHUDLoop()
         end
         y = y + 1
 
-        -- 第四行：AOB
         tmaMonitor.setTextColor(colors.magenta)
         tmaMonitor.setCursorPos(1, y)
         if displayRes then
@@ -778,7 +749,7 @@ local function gpuRefreshRadar(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- RDR GPU 主循环 (相对方位 = paintedYaw)
+-- RDR GPU 主循环
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList==0 then return end
@@ -814,7 +785,6 @@ local function rdrGpuUI()
                                 t.col = col
                                 t.s = math_sin(yawRad)
                                 t.cs = math_cos(yawRad)
-                                -- [修正] 相对本船方位角 = paintedYaw (0正前,90正右)
                                 local relAngle = math_floor((data.paintedYaw) % 360 + 0.5) % 360
                                 t.relAngle = relAngle
                             end
@@ -858,9 +828,7 @@ local function hudMonitorUI()
                     rColor = colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel = targets[selectedTargetId]
-                        -- 相对本船方位角 = paintedYaw
                         local relBoat = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
-                        -- 相对世界方位角 = paintedYaw + 航向
                         local absWorld = math_floor((sel.paintedYaw or 0) + currentNorthYawDeg + 0.5) % 360
                         lText = string.format("%.0f / %.0f", relBoat, absWorld)
                         lColor = colors.white
@@ -912,7 +880,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (三页，保留 TMA 参数但不再使用机动相关，可留作备用)
+-- 终端 UI (三页，去除 TMA 参数编辑)
 -- ==========================================
 local function termUI()
     while true do
@@ -1025,7 +993,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环 (不变)
+-- 输入事件循环
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -1134,25 +1102,36 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络 & 红石 & 测速 & 扫描 (保留)
+-- 网络 & 红石 & 测速 & 扫描 (多频道)
 -- ==========================================
 local function pingLoop()
     while true do
         if currentScreenTab==3 then sleep(0.5)
         else
             if localPos then
-                local msg = {
+                local baseMsg = {
                     v=2, t=1, i=myId, n=myLabel,
                     r=currentRadarRange,
                 }
+                -- 8888 频道
+                local msg8888 = {}
+                for k,v in pairs(baseMsg) do msg8888[k]=v end
                 if localPos.y > -8 then
-                    msg.x = math_floor(localPos.x*10)/10
-                    msg.y = math_floor(localPos.y*10)/10
-                    msg.z = math_floor(localPos.z*10)/10
+                    msg8888.x = math_floor(localPos.x*10)/10
+                    msg8888.y = math_floor(localPos.y*10)/10
+                    msg8888.z = math_floor(localPos.z*10)/10
                 else
-                    msg.x = 0; msg.y = 0; msg.z = 0
+                    msg8888.x = 0; msg8888.y = 0; msg8888.z = 0
                 end
-                modem.transmit(CHANNEL, CHANNEL, msg)
+                modem.transmit(CHANNEL, CHANNEL, msg8888)
+
+                -- 8889 频道 (永远真实坐标)
+                local msg8889 = {}
+                for k,v in pairs(baseMsg) do msg8889[k]=v end
+                msg8889.x = math_floor(localPos.x*10)/10
+                msg8889.y = math_floor(localPos.y*10)/10
+                msg8889.z = math_floor(localPos.z*10)/10
+                modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, msg8889)
             end
             local now=os_clock()
             for id,data in pairs(targets) do
@@ -1171,7 +1150,10 @@ end
 local function listenLoop()
     while true do
         local _,_,ch,_,msg,dist=os_pullEvent("modem_message")
-        if ch==CHANNEL and type(msg)=="table" and msg.v==2 then
+        if type(msg)~="table" or msg.v~=2 then goto nextMsg end
+
+        if ch == CHANNEL then
+            -- 原有频道处理
             if msg.t==1 and msg.i~=myId then
                 if not targets[msg.i] then targets[msg.i] = {id=msg.i} end
                 local t = targets[msg.i]
@@ -1181,6 +1163,37 @@ local function listenLoop()
                 local cd = calcRangingDist(localPos, t.realPos)
                 t.realDist = cd or dist
             elseif msg.t==3 and msg.ti == myId then
+                -- RWR 处理
+                local rwrYaw = nil
+                if msg.x and msg.y and msg.z and localPos then
+                    local sp = {x=msg.x, y=msg.y, z=msg.z}
+                    if currentQAbs and currentQLoc then
+                        local iqx,iqy,iqz,iqw=quatInverse(
+                            currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                        local dx=sp.x-localPos.x
+                        local dy=sp.y-localPos.y
+                        local dz=sp.z-localPos.z
+                        local hx,hy,hz=rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                        local sx,sy,sz=rotateVectorFast(hx,hy,hz,
+                            currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                        rwrYaw=math_deg(math_atan2(-sx,sz))
+                    else
+                        _,rwrYaw=calculateLookAngles(
+                            localPos.x,localPos.y,localPos.z,sp.x,sp.y,sp.z)
+                    end
+                end
+                if rwrYaw then
+                    local normYaw=rwrYaw%360
+                    local sectorIdx=math_floor((normYaw+22.5)/45)%8
+                    local quantYaw=sectorIdx*45
+                    if quantYaw>180 then quantYaw=quantYaw-360 end
+                    table.insert(rwrEvents,{yawDeg=quantYaw,time=os_clock()})
+                end
+                os_queueEvent("rwr_detected")
+            end
+        elseif ch == ACTIVE_SONAR_CHANNEL then
+            -- 主动声纳频道：仅处理被锁定告警（类型3）
+            if msg.t==3 and msg.ti == myId then
                 local rwrYaw = nil
                 if msg.x and msg.y and msg.z and localPos then
                     local sp = {x=msg.x, y=msg.y, z=msg.z}
@@ -1209,6 +1222,7 @@ local function listenLoop()
                 os_queueEvent("rwr_detected")
             end
         end
+        ::nextMsg::
     end
 end
 
@@ -1469,7 +1483,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Hydrophone v2.3.0 - OK")
+print("GHG Hydrophone v2.4.0 - OK")
 print(string.format("  Name      : %s  [fixed]", myLabel))
 print(string.format("  Max Range : %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
