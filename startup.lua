@@ -1,10 +1,10 @@
 --[[
-ASDIC 主动声纳 v1.4.0-debug (完整版)
-- 波束宽度改为180°，整个扇形内的目标立即可见
-- 终端状态页显示最近接收的目标ID与坐标
-- 其余功能：固定扇形，圆点目标，航向偏移，应力门槛等
-使用方法：将此代码保存为 .lua 文件，在 CC:T 计算机上运行。
-确保水听器程序 (v2.4.0 或更高) 正在向 8889 频道广播坐标。
+ASDIC 主动声纳 v1.5.0-debug (通信调试版)
+- 终端实时打印所有 8889 频道消息
+- 放宽目标过滤，只要消息含 x 和 i 就处理
+- 状态页显示最后收到消息的原始内容
+- 其余功能保留：扇形、扫描线、航向偏移等
+使用方法：保存为 .lua 运行，观察终端输出。
 ======================================================================]]
 
 -- ==========================================
@@ -16,7 +16,7 @@ local STRESS_THRESHOLD = 10000.0
 local CHANNEL = 8888
 local LISTEN_CHANNEL = 8889
 local SCAN_SECTOR_HALF = 90
-local SCAN_BEAM_WIDTH = 180           -- 调试用：波束覆盖整个扇形
+local SCAN_BEAM_WIDTH = 20          -- 恢复为正常波束宽度，便于测试真实扫描
 local SEA_LEVEL = -4
 local DEPTH_FILTER = -8
 
@@ -127,8 +127,8 @@ local broadcastOwnPos       = false
 local scanTimeStart = 0
 local scanAngle = 0
 
--- 调试用：记录最后收到的目标信息
-local lastRecv = { id = 0, x = 0, z = 0, time = 0 }
+-- 调试用：记录最后收到的原始消息
+local lastRawMsg = "None"
 
 -- ==========================================
 --  配置文件
@@ -280,14 +280,14 @@ initGpuList()
 local isHeadless = (#hudMonitorList == 0 and #rdrGpuList == 0)
 
 -- ==========================================
--- 注册检查
+-- 注册检查 (完整)
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("ASDIC v1.4.0-debug - Registration Check")
+    print("ASDIC v1.5.0-debug - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -336,7 +336,7 @@ local function checkRegistration()
 end
 
 -- ==========================================
--- 未注册显示并停止
+-- 未注册显示并停止 (完整)
 -- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
@@ -432,7 +432,7 @@ print("Registration OK. Starting ASDIC...")
 sleep(0.5)
 
 -- ==========================================
--- GPU 绘制辅助
+-- GPU 绘制辅助 (固定扇形)
 -- ==========================================
 local function gpuDrawFixedSector(entry)
     local g = entry.gpu
@@ -644,7 +644,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI
+-- 终端 UI (显示最后消息)
 -- ==========================================
 local function termUI()
     while true do
@@ -702,11 +702,7 @@ local function termUI()
             term.setCursorPos(2, row); term.setTextColor(colors.lightGray)
             term.write(string.format("Targets     : %d", targetCount)); row = row + 1
             term.setCursorPos(2, row); term.setTextColor(colors.pink)
-            if lastRecv.id ~= 0 then
-                term.write(string.format("Last Recv: ID %d (%.0f, %.0f)", lastRecv.id, lastRecv.x, lastRecv.z))
-            else
-                term.write("Last Recv: None")
-            end
+            term.write("Last Msg: " .. lastRawMsg)
 
         else
             term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
@@ -856,32 +852,39 @@ local function pingLoop()
     end
 end
 
--- 监听循环：记录最后收到的消息
+-- 监听循环：记录并显示所有消息
 local function listenLoop()
     while true do
         local _, _, ch, _, msg, dist = os_pullEvent("modem_message")
-        if ch == LISTEN_CHANNEL and type(msg) == "table" and msg.v == 2 and msg.t == 1 then
-            local id = msg.i
-            if not targets[id] then targets[id] = {} end
-            local t = targets[id]
-            t.id = id
-            t.name = msg.n
-            t.realPos = { x = msg.x, y = msg.y, z = msg.z }
-            t.lastSeen = os_clock()
-            t.isBeacon = false
-            local cd = calcRangingDist(localPos, t.realPos)
-            t.realDist = cd
-            -- 更新最后接收信息
-            lastRecv.id = id
-            lastRecv.x = msg.x
-            lastRecv.z = msg.z
-            lastRecv.time = os_clock()
+        if ch == LISTEN_CHANNEL then
+            -- 记录原始消息内容
+            if type(msg) == "table" then
+                lastRawMsg = string.format("t=%s i=%s x=%s z=%s", tostring(msg.t), tostring(msg.i), tostring(msg.x), tostring(msg.z))
+            else
+                lastRawMsg = tostring(msg)
+            end
+
+            -- 放宽条件：只要消息含 x 和 i 就尝试处理
+            if type(msg) == "table" and msg.x and msg.i then
+                local id = msg.i
+                if not targets[id] then targets[id] = {} end
+                local t = targets[id]
+                t.id = id
+                t.name = msg.n
+                t.realPos = { x = msg.x, y = msg.y or 0, z = msg.z or 0 }
+                t.lastSeen = os_clock()
+                t.isBeacon = false
+                if localPos then
+                    local cd = calcRangingDist(localPos, t.realPos)
+                    t.realDist = cd
+                end
+            end
         end
     end
 end
 
 -- ==========================================
--- 扫描解算 (波束180°，简化判定)
+-- 扫描解算
 -- ==========================================
 local function cameraLoop()
     scanTimeStart = os_clock()
@@ -896,7 +899,7 @@ local function cameraLoop()
             end
             isAsdicActive = (currentStressCapacity >= STRESS_THRESHOLD)
 
-            -- 更新扫描线角度（仍保留，但波束180°已忽略波束检测）
+            -- 更新扫描线角度
             local now = os_clock()
             local elapsed = now - scanTimeStart
             local period = 4 * SCAN_SECTOR_HALF / SCAN_ANGULAR_SPEED
@@ -934,6 +937,7 @@ local function cameraLoop()
                         end
                     end
 
+                    local beamHalf = SCAN_BEAM_WIDTH / 2
                     for id, data in pairs(targets) do
                         if data.isBeacon then goto continue end
                         if data.realPos and data.realDist and
@@ -955,7 +959,9 @@ local function cameraLoop()
                             end
 
                             local relBearing = getAngleDiff(tYaw, effectiveHeading)
-                            if math_abs(relBearing) <= SCAN_SECTOR_HALF then
+                            local angleDiff = math_abs(getAngleDiff(relBearing, scanAngle))
+                            if angleDiff <= beamHalf then
+                                data.isBeingScanned = true
                                 if not data.lastPainted or (now - data.lastPainted >= 0.5) then
                                     data.paintedPos = data.realPos
                                     data.paintedDist = data.realDist
@@ -990,11 +996,11 @@ end
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.green)
-print("ASDIC v1.4.0-debug - OK")
+print("ASDIC v1.5.0-debug - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Range     : %.0f - %.0f m", MIN_DISTANCE, MAX_DISTANCE))
 print(string.format("  Stress    : %.0f SU required", STRESS_THRESHOLD))
-print(string.format("  Beam Width: %d deg (debug)", SCAN_BEAM_WIDTH))
+print(string.format("  Beam Width: %d deg", SCAN_BEAM_WIDTH))
 print(string.format("  HeadingOff: %.0f deg", headingOffset))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
 print(string.format("  HUD Mon   : %d", #hudMonitorList))
