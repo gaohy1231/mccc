@@ -1,10 +1,10 @@
 --[[
-ASDIC 主动声纳   v1.3.1
-改进：
-- 彻底取消伺服电机
-- 固定扇形，旋转字母，圆点目标，扫描线无箭头
-- 终端状态页显示接收到的目标数量 (Targets)
-- 其余功能保留：双频道、应力门槛、深度/距离过滤、波束扫描、航向偏移等
+ASDIC 主动声纳 v1.4.0-debug (完整版)
+- 波束宽度改为180°，整个扇形内的目标立即可见
+- 终端状态页显示最近接收的目标ID与坐标
+- 其余功能：固定扇形，圆点目标，航向偏移，应力门槛等
+使用方法：将此代码保存为 .lua 文件，在 CC:T 计算机上运行。
+确保水听器程序 (v2.4.0 或更高) 正在向 8889 频道广播坐标。
 ======================================================================]]
 
 -- ==========================================
@@ -13,18 +13,18 @@ ASDIC 主动声纳   v1.3.1
 local MIN_DISTANCE = 100.0
 local MAX_DISTANCE = 600.0
 local STRESS_THRESHOLD = 10000.0
-local CHANNEL = 8888                -- 广播自身位置频道
-local LISTEN_CHANNEL = 8889         -- 监听水听位置频道
-local SCAN_SECTOR_HALF = 90         -- 扇形半角 (总180度)
-local SCAN_BEAM_WIDTH = 20          -- 扫描线波束宽度
-local SEA_LEVEL = -4                -- 海平面 Y 坐标
-local DEPTH_FILTER = -8             -- 深度过滤 Y > -8 不显示
+local CHANNEL = 8888
+local LISTEN_CHANNEL = 8889
+local SCAN_SECTOR_HALF = 90
+local SCAN_BEAM_WIDTH = 180           -- 调试用：波束覆盖整个扇形
+local SEA_LEVEL = -4
+local DEPTH_FILTER = -8
 
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local REG_QUERY_TIMEOUT = 5.0
 
-local SCAN_ANGULAR_SPEED = 30.0     -- 默认扫描角速度 (度/秒)
+local SCAN_ANGULAR_SPEED = 30.0
 
 -- ==========================================
 -- 外设初始化
@@ -97,7 +97,7 @@ local function calcFadeColor(age, hotColor)
 end
 
 -- ==========================================
--- 运行状态 (移除所有伺服电机相关变量)
+-- 运行状态
 -- ==========================================
 local targets               = {}
 local localPos              = nil
@@ -108,13 +108,13 @@ local selectedTargetId      = nil
 local selectedTargetDistStr = nil
 local currentQAbs, currentQLoc = nil, nil
 local yawOffset    = 0
-local headingOffset = 0           -- 航向偏移量
+local headingOffset = 0
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
-local currentNorthYawDeg    = 0      -- 摄像头原始航向
-local currentScreenTab      = 1      -- 1=配置, 2=状态, 3=设备
+local currentNorthYawDeg    = 0
+local currentScreenTab      = 1
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
@@ -124,9 +124,11 @@ local targetPoolCount       = 0
 local isAsdicActive         = false
 local broadcastOwnPos       = false
 
--- 扫描摇摆状态
 local scanTimeStart = 0
 local scanAngle = 0
+
+-- 调试用：记录最后收到的目标信息
+local lastRecv = { id = 0, x = 0, z = 0, time = 0 }
 
 -- ==========================================
 --  配置文件
@@ -167,7 +169,7 @@ end
 loadConfig()
 
 -- ==========================================
--- 算法函数 (同前)
+-- 算法函数
 -- ==========================================
 local function calculateLookAngles(sx, sy, sz, tx, ty, tz)
     local dx, dy, dz = tx - sx, ty - sy, tz - sz
@@ -204,7 +206,7 @@ local C = {
     INNER_RING  = 0x007722,
     GRID        = 0x005518,
     SWEEP       = 0x00FF66,
-    DASH_LINE   = 0x004400,   -- 暗绿色虚线
+    DASH_LINE   = 0x004400,
     YELLOW      = 0xFFFF00,
     WHITE       = 0xFFFFFF,
     BLACK       = 0x000000,
@@ -278,14 +280,14 @@ initGpuList()
 local isHeadless = (#hudMonitorList == 0 and #rdrGpuList == 0)
 
 -- ==========================================
--- 注册检查 (同前)
+-- 注册检查
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("ASDIC v1.3.1 - Registration Check")
+    print("ASDIC v1.4.0-debug - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -334,7 +336,7 @@ local function checkRegistration()
 end
 
 -- ==========================================
--- 未注册显示并停止 (同前)
+-- 未注册显示并停止
 -- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
@@ -430,14 +432,13 @@ print("Registration OK. Starting ASDIC...")
 sleep(0.5)
 
 -- ==========================================
--- GPU 绘制辅助 (固定扇形，旋转字母，无箭头扫描线，刻度虚线)
+-- GPU 绘制辅助
 -- ==========================================
 local function gpuDrawFixedSector(entry)
     local g = entry.gpu
     local cx, cy, r = entry.cx, entry.cy, entry.r
     g.fill(C.BG)
 
-    -- 绘制扇形边界射线 (屏幕上方为0°)
     local leftAngle = -SCAN_SECTOR_HALF
     local rightAngle = SCAN_SECTOR_HALF
     local lx = cx + math_floor(r * math_sin(math_rad(leftAngle)))
@@ -447,7 +448,6 @@ local function gpuDrawFixedSector(entry)
     g.line(cx, cy, lx, ly, C.OUTER_RING)
     g.line(cx, cy, rx, ry, C.OUTER_RING)
 
-    -- 外弧
     local step = 2
     for a = leftAngle, rightAngle, step do
         local x1 = cx + math_floor(r * math_sin(math_rad(a)))
@@ -457,7 +457,6 @@ local function gpuDrawFixedSector(entry)
         g.line(x1, y1, x2, y2, C.OUTER_RING)
     end
 
-    -- 内弧
     local r2 = math_floor(r/2)
     for a = leftAngle, rightAngle, step do
         local x1 = cx + math_floor(r2 * math_sin(math_rad(a)))
@@ -467,12 +466,10 @@ local function gpuDrawFixedSector(entry)
         g.line(x1, y1, x2, y2, C.INNER_RING)
     end
 
-    -- 中心线 (船首，屏幕正上方)
     local mx = cx
     local my = cy - r
     g.line(cx, cy, mx, my, C.GRID)
 
-    -- 每45度虚线刻度 (从圆心到外圈)
     for deg = -90, 90, 45 do
         local rad = math_rad(deg)
         local ex = cx + math_floor(r * math_sin(rad))
@@ -489,7 +486,6 @@ local function gpuDrawFixedSector(entry)
         end
     end
 
-    -- 方向字母 (N/E/S/W) 基于真实航向 + headingOffset，逆时针绘制在屏幕坐标上
     local trueHeading = (currentNorthYawDeg + headingOffset) % 360
     local dirs = {
         {angle=0,   label="N"},
@@ -519,7 +515,6 @@ local function gpuRefreshASDIC(entry, isActive, poolCount, pool)
     local r = entry.r
     local cx, cy = entry.cx, entry.cy
 
-    -- 绘制目标点 (圆点)
     for i = 1, poolCount do
         local t = pool[i]
         if t and t.col then
@@ -529,7 +524,6 @@ local function gpuRefreshASDIC(entry, isActive, poolCount, pool)
         end
     end
 
-    -- 绘制扫描线 (相对角度 scanAngle，直接画在屏幕上，无箭头)
     local sweepRad = math_rad(scanAngle)
     local ex = cx + math_floor(r * math_sin(sweepRad))
     local ey = cy - math_floor(r * math_cos(sweepRad))
@@ -539,7 +533,7 @@ local function gpuRefreshASDIC(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- RDR GPU 主循环 (目标池使用相对角度)
+-- RDR GPU 主循环
 -- ==========================================
 local function rdrGpuUI()
     if #rdrGpuList == 0 then return end
@@ -577,7 +571,7 @@ local function rdrGpuUI()
                                     if not t then t = {}; targetPool[targetPoolCount] = t end
                                     t.col = col
                                     t.distRatio = distRatio
-                                    local screenRad = math_rad(relBearing)   -- 左负右正
+                                    local screenRad = math_rad(relBearing)
                                     t.s = math_sin(screenRad)
                                     t.cs = math_cos(screenRad)
                                 end
@@ -650,7 +644,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (移除 Motor Offset 和 Motor Angle 显示，新增目标计数)
+-- 终端 UI
 -- ==========================================
 local function termUI()
     while true do
@@ -679,7 +673,6 @@ local function termUI()
                 term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
-            -- 菜单项共5项
             drawInputBox(5,  "Disp. Offset  :", yawOffset, menuIndex == 1, isEditing)
             drawInputBox(7,  "Heading Offset:", headingOffset, menuIndex == 2, isEditing)
             drawInputBox(9,  "Aim Precis    :", aimPrecision, menuIndex == 3, isEditing)
@@ -704,11 +697,16 @@ local function termUI()
             term.write(string.format("Scan Angle  : %.1f deg", scanAngle)); row = row + 1
             term.setCursorPos(2, row); term.setTextColor(colors.white)
             term.write(string.format("Broadcast   : %s", broadcastOwnPos and "YES" or "NO")); row = row + 1
-            -- 新增：显示当前收到的目标数量
             local targetCount = 0
             for _ in pairs(targets) do targetCount = targetCount + 1 end
             term.setCursorPos(2, row); term.setTextColor(colors.lightGray)
-            term.write(string.format("Targets     : %d", targetCount))
+            term.write(string.format("Targets     : %d", targetCount)); row = row + 1
+            term.setCursorPos(2, row); term.setTextColor(colors.pink)
+            if lastRecv.id ~= 0 then
+                term.write(string.format("Last Recv: ID %d (%.0f, %.0f)", lastRecv.id, lastRecv.x, lastRecv.z))
+            else
+                term.write("Last Recv: None")
+            end
 
         else
             term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
@@ -744,7 +742,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环 (菜单项调整为5项)
+-- 输入事件循环
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -858,6 +856,7 @@ local function pingLoop()
     end
 end
 
+-- 监听循环：记录最后收到的消息
 local function listenLoop()
     while true do
         local _, _, ch, _, msg, dist = os_pullEvent("modem_message")
@@ -872,12 +871,17 @@ local function listenLoop()
             t.isBeacon = false
             local cd = calcRangingDist(localPos, t.realPos)
             t.realDist = cd
+            -- 更新最后接收信息
+            lastRecv.id = id
+            lastRecv.x = msg.x
+            lastRecv.z = msg.z
+            lastRecv.time = os_clock()
         end
     end
 end
 
 -- ==========================================
--- 扫描解算 (不再读取伺服电机)
+-- 扫描解算 (波束180°，简化判定)
 -- ==========================================
 local function cameraLoop()
     scanTimeStart = os_clock()
@@ -892,7 +896,7 @@ local function cameraLoop()
             end
             isAsdicActive = (currentStressCapacity >= STRESS_THRESHOLD)
 
-            -- 更新扫描线角度
+            -- 更新扫描线角度（仍保留，但波束180°已忽略波束检测）
             local now = os_clock()
             local elapsed = now - scanTimeStart
             local period = 4 * SCAN_SECTOR_HALF / SCAN_ANGULAR_SPEED
@@ -903,7 +907,6 @@ local function cameraLoop()
                 scanAngle = SCAN_SECTOR_HALF - 4 * SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
-            -- 摄像头获取位置和原始航向
             if camera then
                 local ok, pos = pcall(camera.getCameraPosition)
                 if ok and pos then localPos = pos else localPos = nil end
@@ -924,7 +927,6 @@ local function cameraLoop()
                 local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                 local refPos = localPos
                 if isAsdicActive and refPos then
-                    -- 更新距离
                     for _, data in pairs(targets) do
                         if data.realPos and not data.isBeacon then
                             local cd = calcRangingDist(refPos, data.realPos)
@@ -932,10 +934,8 @@ local function cameraLoop()
                         end
                     end
 
-                    local beamHalf = SCAN_BEAM_WIDTH / 2
                     for id, data in pairs(targets) do
                         if data.isBeacon then goto continue end
-                        data.isBeingScanned = false
                         if data.realPos and data.realDist and
                            data.realDist >= MIN_DISTANCE and data.realDist <= MAX_DISTANCE and
                            data.realPos.y <= DEPTH_FILTER and
@@ -954,18 +954,13 @@ local function cameraLoop()
                                 _, tYaw = calculateLookAngles(refPos.x, refPos.y, refPos.z, data.realPos.x, data.realPos.y, data.realPos.z)
                             end
 
-                            -- 相对有效航向的方位
                             local relBearing = getAngleDiff(tYaw, effectiveHeading)
-                            -- 检查是否在波束宽度内
-                            local angleDiff = math_abs(getAngleDiff(relBearing, scanAngle))
-                            if angleDiff <= beamHalf then
-                                data.isBeingScanned = true
+                            if math_abs(relBearing) <= SCAN_SECTOR_HALF then
                                 if not data.lastPainted or (now - data.lastPainted >= 0.5) then
                                     data.paintedPos = data.realPos
                                     data.paintedDist = data.realDist
-                                    data.paintedYaw = tYaw    -- 绝对方位
+                                    data.paintedYaw = tYaw
                                     data.lastPainted = now
-
                                     -- 发送类型3告警
                                     modem.transmit(LISTEN_CHANNEL, LISTEN_CHANNEL, {
                                         v = 2, t = 3, si = myId, ti = id,
@@ -973,7 +968,6 @@ local function cameraLoop()
                                         y = math_floor(localPos.y * 10) / 10,
                                         z = math_floor(localPos.z * 10) / 10,
                                     })
-
                                     if id == selectedTargetId then
                                         local depth = SEA_LEVEL - data.realPos.y
                                         selectedTargetDistStr = string.format("%.0f m / %.0f m", depth, data.realDist)
@@ -996,11 +990,11 @@ end
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.green)
-print("ASDIC v1.3.1 - OK")
+print("ASDIC v1.4.0-debug - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Range     : %.0f - %.0f m", MIN_DISTANCE, MAX_DISTANCE))
 print(string.format("  Stress    : %.0f SU required", STRESS_THRESHOLD))
-print(string.format("  Scan Speed: %.1f deg/s", SCAN_ANGULAR_SPEED))
+print(string.format("  Beam Width: %d deg (debug)", SCAN_BEAM_WIDTH))
 print(string.format("  HeadingOff: %.0f deg", headingOffset))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
 print(string.format("  HUD Mon   : %d", #hudMonitorList))
