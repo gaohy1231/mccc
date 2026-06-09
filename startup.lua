@@ -1,36 +1,46 @@
 --[[
-ASDIC 主动声纳 v1.8.0-debug (零过滤调试版)
-- 接收任何 8889 频道消息，立即作为目标显示
-- 无距离、深度、扇形限制
-- 状态页显示最后收到的消息内容和目标数量
-- 航向已修正为0°=北
+雷达 + 主动声纳 二合一系统   v1.0.0
+- 两个 GPU 屏幕：雷达圆形 PPI + 声纳扇形 ASDIC
+- 两个 HUD：雷达状态 + 声纳状态
+- 终端 UI 三页：参数(雷达/声纳)、系统状态、设备列表
+- 共享目标数据，雷达扫描伺服，声纳软件扫描
+- 网络：雷达监听 8888，声纳监听 8889，可选向 8888 广播自身位置
 ======================================================================]]
 
 -- ==========================================
---  全局配置
+--  全局配置（雷达部分）
 -- ==========================================
-local STRESS_THRESHOLD = 10000.0
-local CHANNEL = 8888
-local LISTEN_CHANNEL = 8889
-local SCAN_SECTOR_HALF = 90
-local SCAN_BEAM_WIDTH = 180              -- 波束宽度180°，覆盖整个扇形
-local SEA_LEVEL = -4
-local DEPTH_FILTER = 9999                -- 调试用，不过滤深度
+local MAX_DISTANCE_LIMIT       = 5000.0
+local STRESS_TO_DISTANCE_RATIO = 2.0
+local CHANNEL                  = 8888          -- 雷达网络频道
+local ACTIVE_SONAR_CHANNEL     = 8889          -- 声纳监听频道
+local SCAN_SECTOR_WIDTH        = 20            -- 雷达扫描扇区宽度（度）
+local SEA_LEVEL                = -4
 
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
-local REG_QUERY_TIMEOUT = 5.0
+local SPEED_FILTER_MIN     = 4.0             -- km/h，雷达速度过滤
 
-local SCAN_ANGULAR_SPEED = 30.0
+-- 主动声纳部分
+local ASDIC_MIN_DISTANCE    = 100.0
+local ASDIC_MAX_DISTANCE    = 600.0
+local ASDIC_STRESS_THRESHOLD = 10000.0
+local ASDIC_SCAN_SECTOR_HALF = 90
+local ASDIC_SCAN_BEAM_WIDTH  = 20
+local ASDIC_DEPTH_FILTER     = -8
+local ASDIC_SCAN_ANGULAR_SPEED = 30.0
+
+local REG_QUERY_TIMEOUT = 5.0
 
 -- ==========================================
 -- 外设初始化
 -- ==========================================
 local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
-if not modem then error("Wireless or Ender Modem not found!", 0) end
+if not modem then error("Wireless Modem not found!", 0) end
 modem.open(CHANNEL)
-modem.open(LISTEN_CHANNEL)
+modem.open(ACTIVE_SONAR_CHANNEL)
 
+-- 摄像头
 local camera, cameraName = nil, nil
 for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "camera" then
@@ -41,10 +51,16 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 if not camera then error("Camera not found!", 0) end
 
+local HAS_FORCE_API = (camera.forcePitchYaw ~= nil)
+local function applyCameraAngle(p, y)
+    if HAS_FORCE_API then camera.forcePitchYaw(p, y)
+    else camera.setPitch(p); camera.setYaw(y) end
+end
+
 redstone.setOutput("front", false)
 
 local myId        = os.getComputerID()
-local CONFIG_FILE = "asdic_config.txt"
+local CONFIG_FILE = "radar_asdic_config.txt"
 
 -- ==========================================
 -- 全局 API 别名
@@ -61,6 +77,7 @@ local math_sin      = math.sin
 local math_cos      = math.cos
 local os_clock      = os.clock
 local os_pullEvent  = os.pullEvent
+local os_queueEvent = os.queueEvent
 
 -- ==========================================
 -- 颜色工具
@@ -93,66 +110,108 @@ local targets               = {}
 local localPos              = nil
 local selectedTargetId      = nil
 local currentQAbs, currentQLoc = nil, nil
+local currentServoAngle        = 0
+local isServoConnected         = false
 local yawOffset    = 0
-local headingOffset = 0
+local motorOffset  = 0
+local headingOffset = 0           -- 声纳航向偏移
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
-local currentNorthYawDeg    = 0
-local currentScreenTab      = 1
+local currentRadarRange     = 0
+local currentNorthYawDeg    = 0      -- 船首航向（修正后0°=北）
+local currentScreenTab      = 1      -- 1=参数, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
 local cachedStressometer    = peripheral.find("Create_Stressometer")
-local targetPool            = {}
-local targetPoolCount       = 0
-local isAsdicActive         = false
-local broadcastOwnPos       = false
+local cachedServo           = peripheral.find("servo")
+local broadcastOwnPos       = false   -- 是否向8888广播自身位置
 
-local scanTimeStart = 0
-local scanAngle = 0
+-- 雷达目标池
+local radarPool      = {}
+local radarPoolCount = 0
 
--- 调试用：最后收到的消息
-local lastRawMsg = "None"
+-- 声纳状态
+local isAsdicActive  = false
+local asdicScanAngle  = 0
+local asdicTargetPool = {}
+local asdicPoolCount  = 0
 
 -- ==========================================
---  配置文件
+--  GPU / HUD 分配（自动取前两个）
 -- ==========================================
-local function loadConfig()
-    if fs.exists(CONFIG_FILE) then
-        local f    = fs.open(CONFIG_FILE, "r")
-        local data = textutils.unserialize(f.readAll())
-        f.close()
-        if type(data) == "table" then
-            if data.yawOffset    then yawOffset    = tonumber(data.yawOffset)   or 0 end
-            if data.headingOffset then headingOffset = tonumber(data.headingOffset) or 0 end
-            if data.aimPrecision then
-                local p = tonumber(data.aimPrecision)
-                if p and p >= 1 and p <= 90 and (360 % math_floor(p) == 0) then
-                    aimPrecision = math_floor(p)
-                end
+local radarGpu = nil
+local asdicGpu = nil
+local radarHud = nil
+local asdicHud = nil
+
+local rdrGpuList = {}
+local gpuNameMap = {}
+local hudMonitorList = {}
+
+local function initPeripherals()
+    -- 分配 GPU
+    local gpuIdx = 0
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "tm_gpu" then
+            local g = peripheral.wrap(name)
+            pcall(g.refreshSize)
+            pcall(g.setSize, 64)
+            pcall(g.fill, 0x050A05)
+            local ok, w, h = pcall(g.getSize)
+            if not ok then w, h = 256, 128 end
+            w = w or 256; h = h or 128
+            local cx = math_floor(w / 2)
+            local cy = math_floor(h / 2)
+            local r  = math_floor(math_min(cx, cy) * 0.88)
+            local bw = math_max(1, math_floor(w / 85))
+            local bh = math_max(1, math_floor(h / 64))
+            local entry = {
+                gpu=g, name=name, w=w, h=h, cx=cx, cy=cy, r=r,
+                bw=bw, bh=bh, dotSize=1,
+            }
+            table.insert(rdrGpuList, entry)
+            gpuNameMap[name] = entry
+            if gpuIdx == 0 then
+                radarGpu = entry
+            elseif gpuIdx == 1 then
+                asdicGpu = entry
             end
-            if type(data.monitorModes) == "table" then monitorModes = data.monitorModes end
-            if data.broadcastOwnPos ~= nil then broadcastOwnPos = data.broadcastOwnPos end
-            if data.scanAngularSpeed then SCAN_ANGULAR_SPEED = tonumber(data.scanAngularSpeed) or SCAN_ANGULAR_SPEED end
+            gpuIdx = gpuIdx + 1
+        end
+    end
+
+    -- 分配 HUD
+    local monIdx = 0
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            local m = peripheral.wrap(name)
+            m.setTextScale(1)
+            local cw, ch = m.getSize()
+            local bw = math.ceil(cw / 9)
+            local bh = math.ceil(ch / 7)
+            if bw >= 5 then bw = bw - 1 end
+            local entry = {
+                m=m, name=name,
+                bw=math.max(1, bw), bh=math.max(1, bh),
+                mode=monitorModes[name] or "STATUS",
+                lastText={}
+            }
+            table.insert(hudMonitorList, entry)
+            if monIdx == 0 then
+                radarHud = entry
+            elseif monIdx == 1 then
+                asdicHud = entry
+            end
+            monIdx = monIdx + 1
         end
     end
 end
+initPeripherals()
 
-local function saveConfig()
-    local f = fs.open(CONFIG_FILE, "w")
-    f.write(textutils.serialize({
-        yawOffset        = yawOffset,
-        headingOffset    = headingOffset,
-        aimPrecision     = aimPrecision,
-        monitorModes     = monitorModes,
-        broadcastOwnPos  = broadcastOwnPos,
-        scanAngularSpeed = SCAN_ANGULAR_SPEED,
-    }))
-    f.close()
-end
-loadConfig()
+local isHeadless = (#rdrGpuList == 0 and #hudMonitorList == 0)
 
 -- ==========================================
 -- 算法函数
@@ -184,107 +243,63 @@ local function calcRangingDist(refPos, targetPos)
 end
 
 -- ==========================================
--- 颜色常量
+-- 配置文件
 -- ==========================================
-local C = {
-    BG          = 0x050A05,
-    OUTER_RING  = 0x00CC44,
-    INNER_RING  = 0x007722,
-    GRID        = 0x005518,
-    SWEEP       = 0x00FF66,
-    DASH_LINE   = 0x004400,
-    YELLOW      = 0xFFFF00,
-    WHITE       = 0xFFFFFF,
-    BLACK       = 0x000000,
-    TARGET_HOT  = 0xFF6600,
-    BEACON_UNK  = 0xFFFF44,
-    UNREG_FG    = 0xFF2200,
-    UNREG_BG    = 0x1A0000,
-}
-
--- ==========================================
--- HUD 监视器列表
--- ==========================================
-local hudMonitorList = {}
-local mIndex = 1
-for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == "monitor" then
-        local m = peripheral.wrap(name)
-        m.setTextScale(1)
-        local cw, ch = m.getSize()
-        local bw = math.ceil(cw / 9)
-        local bh = math.ceil(ch / 7)
-        if bw >= 5 then bw = bw - 1 end
-        table.insert(hudMonitorList, {
-            m           = m,
-            name        = name,
-            displayName = "Monitor " .. mIndex,
-            bw          = math.max(1, bw),
-            bh          = math.max(1, bh),
-            mode        = monitorModes[name] or "STATUS",
-            lastSText   = nil, lastLText = nil,
-        })
-        mIndex = mIndex + 1
-    end
-end
-
--- ==========================================
--- RDR GPU 列表
--- ==========================================
-local BLOCK_PX_W = 85
-local BLOCK_PX_H = 64
-local rdrGpuList = {}
-local gpuNameMap = {}
-
-local function initGpuList()
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "tm_gpu" then
-            local g = peripheral.wrap(name)
-            pcall(g.refreshSize)
-            pcall(g.setSize, 64)
-            pcall(g.fill, C.BG)
-            local ok, w, h = pcall(g.getSize)
-            if not ok then w, h = 256, 128 end
-            w = w or 256; h = h or 128
-            local cx = math_floor(w / 2)
-            local cy = math_floor(h / 2)
-            local r  = math_floor(math_min(cx, cy) * 0.88)
-            local bw = math_max(1, math_floor(w / BLOCK_PX_W))
-            local bh = math_max(1, math_floor(h / BLOCK_PX_H))
-            local dotSize = 1
-            local entry = {
-                gpu=g, name=name, w=w, h=h, cx=cx, cy=cy, r=r,
-                bw=bw, bh=bh, dotSize=dotSize,
-            }
-            table.insert(rdrGpuList, entry)
-            gpuNameMap[name] = entry
+local function loadConfig()
+    if fs.exists(CONFIG_FILE) then
+        local f    = fs.open(CONFIG_FILE, "r")
+        local data = textutils.unserialize(f.readAll())
+        f.close()
+        if type(data) == "table" then
+            if data.yawOffset    then yawOffset    = tonumber(data.yawOffset)   or 0 end
+            if data.motorOffset  then motorOffset  = tonumber(data.motorOffset) or 0 end
+            if data.headingOffset then headingOffset = tonumber(data.headingOffset) or 0 end
+            if data.aimPrecision then
+                local p = tonumber(data.aimPrecision)
+                if p and p >= 1 and p <= 90 and (360 % math_floor(p) == 0) then
+                    aimPrecision = math_floor(p)
+                end
+            end
+            if type(data.monitorModes) == "table" then monitorModes = data.monitorModes end
+            if data.broadcastOwnPos ~= nil then broadcastOwnPos = data.broadcastOwnPos end
         end
     end
 end
-initGpuList()
 
-local isHeadless = (#hudMonitorList == 0 and #rdrGpuList == 0)
+local function saveConfig()
+    local f = fs.open(CONFIG_FILE, "w")
+    f.write(textutils.serialize({
+        yawOffset    = yawOffset,
+        motorOffset  = motorOffset,
+        headingOffset = headingOffset,
+        aimPrecision = aimPrecision,
+        monitorModes = monitorModes,
+        broadcastOwnPos = broadcastOwnPos,
+    }))
+    f.close()
+end
+loadConfig()
 
 -- ==========================================
--- 注册检查 (完整)
+-- 注册检查
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("ASDIC v1.8.0-debug - Registration Check")
+    print("Radar+ASDIC v1.0.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
 
     for _, entry in ipairs(rdrGpuList) do
         pcall(function()
-            entry.gpu.fill(C.BG)
+            entry.gpu.fill(0x050A05)
             local msg = "CHECKING..."
             local tx  = math_max(1, entry.cx - math_floor(#msg * 6))
             local ty  = entry.cy - 8
-            pcall(entry.gpu.drawText, tx, ty, msg, C.YELLOW, C.BG, 2)
+            pcall(entry.gpu.drawText, tx, ty, msg, 0xFFFF00, 0x050A05, 2)
             entry.gpu.sync()
         end)
     end
@@ -300,8 +315,9 @@ local function checkRegistration()
                 if d.t == 5 and d.ti == myId then
                     os.cancelTimer(timer)
                     myLabel = tostring(d.n or myLabel)
+                    MAX_DISTANCE_LIMIT = tonumber(d.r) or MAX_DISTANCE_LIMIT
                     term.setTextColor(colors.lime)
-                    print(string.format("Registered!  Name: %s", myLabel))
+                    print(string.format("Registered!  Name: %s  MaxRange: %.0fm", myLabel, MAX_DISTANCE_LIMIT))
                     sleep(0.8)
                     return true
                 elseif d.t == 6 and d.ti == myId then
@@ -322,32 +338,27 @@ local function checkRegistration()
 end
 
 -- ==========================================
--- 未注册显示并停止 (完整)
+-- 未注册显示并停止
 -- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
         pcall(function()
             local g  = entry.gpu
-            local cx = entry.cx
-            local cy = entry.cy
-            local w  = entry.w
-            local h  = entry.h
-            g.fill(C.UNREG_BG)
+            local cx = entry.cx; local cy = entry.cy; local w = entry.w; local h = entry.h
+            g.fill(0x1A0000)
             local bx1, by1 = math_floor(cx * 0.3), math_floor(cy * 0.5)
             local bx2, by2 = w - bx1, h - by1
-            g.line(bx1, by1, bx2, by1, C.UNREG_FG)
-            g.line(bx1, by2, bx2, by2, C.UNREG_FG)
-            g.line(bx1, by1, bx1, by2, C.UNREG_FG)
-            g.line(bx2, by1, bx2, by2, C.UNREG_FG)
+            g.line(bx1, by1, bx2, by1, 0xFF2200); g.line(bx1, by2, bx2, by2, 0xFF2200)
+            g.line(bx1, by1, bx1, by2, 0xFF2200); g.line(bx2, by1, bx2, by2, 0xFF2200)
             local line1 = "NOT REGISTERED"
             local tx1   = math_max(bx1 + 4, cx - math_floor(#line1 * 6))
-            pcall(g.drawText, tx1, cy - 14, line1, C.UNREG_FG, C.UNREG_BG, 2)
+            pcall(g.drawText, tx1, cy - 14, line1, 0xFF2200, 0x1A0000, 2)
             local line2 = string.format("ID: %d", myId)
             local tx2   = math_max(bx1 + 4, cx - math_floor(#line2 * 3))
-            pcall(g.drawText, tx2, cy + 6,  line2, 0xAAAAAA, C.UNREG_BG, 1)
+            pcall(g.drawText, tx2, cy + 6,  line2, 0xAAAAAA, 0x1A0000, 1)
             local line3 = "Register in scanner"
             local tx3   = math_max(bx1 + 4, cx - math_floor(#line3 * 3))
-            pcall(g.drawText, tx3, cy + 18, line3, 0x666666, C.UNREG_BG, 1)
+            pcall(g.drawText, tx3, cy + 18, line3, 0x666666, 0x1A0000, 1)
             g.sync()
         end)
     end
@@ -385,8 +396,8 @@ local function showNotRegisteredAndHalt()
         { "",                         colors.red    },
         { "",                         colors.white  },
         { "ID: " .. myId,             colors.white  },
-        { "Register this ASDIC",      colors.gray   },
-        { "in scanner first.",        colors.gray   },
+        { "Register this unit in",    colors.gray   },
+        { "scanner first.",           colors.gray   },
         { "",                         colors.white  },
         { "Program halted.",          colors.orange },
     }
@@ -414,48 +425,143 @@ term.setBackgroundColor(colors.black)
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.green)
-print("Registration OK. Starting ASDIC...")
+print("Registration OK. Starting system...")
 sleep(0.5)
 
 -- ==========================================
--- GPU 绘制辅助 (固定扇形)
+-- 雷达 GPU 绘制函数（圆形 PPI）
 -- ==========================================
-local function gpuDrawFixedSector(entry)
+local function drawRadarBase(entry)
     local g = entry.gpu
     local cx, cy, r = entry.cx, entry.cy, entry.r
-    g.fill(C.BG)
+    g.fill(0x050A05)
 
-    local leftAngle = -SCAN_SECTOR_HALF
-    local rightAngle = SCAN_SECTOR_HALF
+    -- 外圈、内圈
+    local function circle(cx, cy, r, col)
+        local x, y, d = r, 0, 1 - r
+        while x >= y do
+            g.line(cx+x,cy+y,cx+x,cy+y,col); g.line(cx-x,cy+y,cx-x,cy+y,col)
+            g.line(cx+x,cy-y,cx+x,cy-y,col); g.line(cx-x,cy-y,cx-x,cy-y,col)
+            g.line(cx+y,cy+x,cx+y,cy+x,col); g.line(cx-y,cy+x,cx-y,cy+x,col)
+            g.line(cx+y,cy-x,cx+y,cy-x,col); g.line(cx-y,cy-x,cx-y,cy-x,col)
+            y = y + 1
+            if d < 0 then d = d + 2*y + 1
+            else x = x - 1; d = d + 2*(y-x) + 1 end
+        end
+    end
+    circle(cx, cy, r, 0x00CC44)
+    circle(cx, cy, math_floor(r/2), 0x007722)
+
+    -- 十字线
+    g.line(cx, cy-r, cx, cy+r, 0x005518)
+    g.line(cx-r, cy, cx+r, cy, 0x005518)
+
+    -- 网格点
+    for t = -r, r do
+        if t % 4 < 2 then
+            local py = cy + t
+            local px1 = cx + t
+            if (px1-cx)^2 + (py-cy)^2 <= r*r then g.line(px1, py, px1, py, 0x005518) end
+            local px2 = cx - t
+            if (px2-cx)^2 + (py-cy)^2 <= r*r then g.line(px2, py, px2, py, 0x005518) end
+        end
+    end
+
+    -- N 标记
+    local northRad = math_rad(currentNorthYawDeg + yawOffset)
+    local nx = cx + math_floor(r * math_sin(northRad) + 0.5)
+    local ny = cy - math_floor(r * math_cos(northRad) + 0.5)
+    local tX = math_max(1, math_min(entry.w-6, nx - 3))
+    local tY = math_max(1, math_min(entry.h-8, ny - 4))
+    pcall(g.drawText, tX, tY, "N", 0xFFFF00, 0x050A05, 1)
+end
+
+local function drawRadarSweep(entry, angleDeg)
+    local g = entry.gpu
+    local cx, cy, r = entry.cx, entry.cy, entry.r
+    local rad = math_rad(angleDeg + yawOffset)
+    local ex = cx + math_floor(r * math_sin(rad) + 0.5)
+    local ey = cy - math_floor(r * math_cos(rad) + 0.5)
+    g.line(cx, cy, ex, ey, 0xFFFFFF)
+    -- 箭头
+    local arrowLen = 3
+    local a1 = rad + math_rad(150)
+    local a2 = rad - math_rad(150)
+    g.line(ex, ey, ex + math_floor(arrowLen * math_sin(a1)), ey - math_floor(arrowLen * math_cos(a1)), 0xFFFFFF)
+    g.line(ex, ey, ex + math_floor(arrowLen * math_sin(a2)), ey - math_floor(arrowLen * math_cos(a2)), 0xFFFFFF)
+end
+
+local function refreshRadar(entry, isActive, poolCount, pool)
+    local g = entry.gpu
+    if not isActive then g.fill(0x050A05); g.sync(); return end
+    drawRadarBase(entry)
+    local lineLength = entry.r * 0.75
+    for i = 1, poolCount do
+        local t = pool[i]
+        if t and t.col then
+            local endX = entry.cx + math_floor(lineLength * t.s + 0.5)
+            local endY = entry.cy - math_floor(lineLength * t.cs + 0.5)
+            g.line(entry.cx, entry.cy, endX, endY, t.col)
+            -- 标注相对方位
+            if t.relAngle then
+                local angleStr = tostring(t.relAngle) .. "°"
+                local textX = endX + math_floor(5 * t.s + 0.5)
+                local textY = endY - math_floor(5 * t.cs + 0.5) - 4
+                textX = math_max(2, math_min(entry.w - #angleStr * 3, textX))
+                textY = math_max(2, math_min(entry.h - 8, textY))
+                pcall(g.drawText, textX, textY, angleStr, t.col, 0x050A05, 0.5)
+            end
+        end
+    end
+    drawRadarSweep(entry, currentServoAngle)
+    g.sync()
+end
+
+-- ==========================================
+-- 声纳 GPU 绘制函数（固定扇形）
+-- ==========================================
+local function drawAsdicSector(entry)
+    local g = entry.gpu
+    local cx, cy, r = entry.cx, entry.cy, entry.r
+    g.fill(0x050A05)
+
+    local leftAngle = -ASDIC_SCAN_SECTOR_HALF
+    local rightAngle = ASDIC_SCAN_SECTOR_HALF
+
+    -- 边界射线
     local lx = cx + math_floor(r * math_sin(math_rad(leftAngle)))
     local ly = cy - math_floor(r * math_cos(math_rad(leftAngle)))
     local rx = cx + math_floor(r * math_sin(math_rad(rightAngle)))
     local ry = cy - math_floor(r * math_cos(math_rad(rightAngle)))
-    g.line(cx, cy, lx, ly, C.OUTER_RING)
-    g.line(cx, cy, rx, ry, C.OUTER_RING)
+    g.line(cx, cy, lx, ly, 0x00CC44)
+    g.line(cx, cy, rx, ry, 0x00CC44)
 
+    -- 外弧
     local step = 2
     for a = leftAngle, rightAngle, step do
         local x1 = cx + math_floor(r * math_sin(math_rad(a)))
         local y1 = cy - math_floor(r * math_cos(math_rad(a)))
         local x2 = cx + math_floor(r * math_sin(math_rad(a + step)))
         local y2 = cy - math_floor(r * math_cos(math_rad(a + step)))
-        g.line(x1, y1, x2, y2, C.OUTER_RING)
+        g.line(x1, y1, x2, y2, 0x00CC44)
     end
 
+    -- 内弧
     local r2 = math_floor(r/2)
     for a = leftAngle, rightAngle, step do
         local x1 = cx + math_floor(r2 * math_sin(math_rad(a)))
         local y1 = cy - math_floor(r2 * math_cos(math_rad(a)))
         local x2 = cx + math_floor(r2 * math_sin(math_rad(a + step)))
         local y2 = cy - math_floor(r2 * math_cos(math_rad(a + step)))
-        g.line(x1, y1, x2, y2, C.INNER_RING)
+        g.line(x1, y1, x2, y2, 0x007722)
     end
 
+    -- 中心线（船首，屏幕正上方）
     local mx = cx
     local my = cy - r
-    g.line(cx, cy, mx, my, C.GRID)
+    g.line(cx, cy, mx, my, 0x005518)
 
+    -- 45度虚线刻度
     for deg = -90, 90, 45 do
         local rad = math_rad(deg)
         local ex = cx + math_floor(r * math_sin(rad))
@@ -467,11 +573,12 @@ local function gpuDrawFixedSector(entry)
             if i % 2 == 0 then
                 local px = cx + math_floor(dx * i / steps)
                 local py = cy + math_floor(dy * i / steps)
-                g.line(px, py, px, py, C.DASH_LINE)
+                g.line(px, py, px, py, 0x004400)
             end
         end
     end
 
+    -- 方向字母 N/E/S/W
     local trueHeading = (currentNorthYawDeg + headingOffset) % 360
     local dirs = {
         {angle=0,   label="N"},
@@ -485,227 +592,174 @@ local function gpuDrawFixedSector(entry)
         local ty = cy - math_floor((r + 5) * math_cos(screenAngle)) - 4
         tx = math_max(1, math_min(entry.w - 6, tx))
         ty = math_max(1, math_min(entry.h - 8, ty))
-        pcall(g.drawText, tx, ty, d.label, C.WHITE, C.BG, 1)
+        pcall(g.drawText, tx, ty, d.label, 0xFFFFFF, 0x050A05, 1)
     end
 end
 
-local function gpuRefreshASDIC(entry, isActive, poolCount, pool)
+local function refreshAsdic(entry, isActive, poolCount, pool)
     local g = entry.gpu
-    if not isActive then
-        g.fill(C.BG)
-        g.sync()
-        return
-    end
-
-    gpuDrawFixedSector(entry)
-    local r = entry.r
-    local cx, cy = entry.cx, entry.cy
-
+    if not isActive then g.fill(0x050A05); g.sync(); return end
+    drawAsdicSector(entry)
     for i = 1, poolCount do
         local t = pool[i]
         if t and t.col then
-            local px = cx + math_floor(r * t.distRatio * t.s + 0.5)
-            local py = cy - math_floor(r * t.distRatio * t.cs + 0.5)
+            local px = entry.cx + math_floor(entry.r * t.distRatio * t.s + 0.5)
+            local py = entry.cy - math_floor(entry.r * t.distRatio * t.cs + 0.5)
             g.line(px, py, px, py, t.col)
         end
     end
-
-    local sweepRad = math_rad(scanAngle)
-    local ex = cx + math_floor(r * math_sin(sweepRad))
-    local ey = cy - math_floor(r * math_cos(sweepRad))
-    g.line(cx, cy, ex, ey, C.SWEEP)
-
+    -- 扫描线
+    local rad = math_rad(asdicScanAngle)
+    local ex = entry.cx + math_floor(entry.r * math_sin(rad))
+    local ey = entry.cy - math_floor(entry.r * math_cos(rad))
+    g.line(entry.cx, entry.cy, ex, ey, 0x00FF66)
     g.sync()
 end
 
 -- ==========================================
--- RDR GPU 主循环 (无过滤)
+-- 雷达 HUD 绘制
 -- ==========================================
-local function rdrGpuUI()
-    if #rdrGpuList == 0 then return end
-    local frames = 0
-    while true do
-        if currentScreenTab == 3 then
-            for _, entry in ipairs(rdrGpuList) do
-                pcall(function()
-                    entry.gpu.fill(C.BG)
-                    pcall(entry.gpu.drawText, entry.cx - 6, entry.cy - 4, entry.name, C.WHITE, C.BG, 2)
-                    entry.gpu.sync()
-                end)
-            end
-            sleep(0.3)
-        else
-            frames = frames + 1
-            local isActive = isAsdicActive
-            targetPoolCount = 0
-            local now = os_clock()
-            local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
-
-            if localPos and isActive then
-                for _, data in pairs(targets) do
-                    if data.lastPainted and not data.isBeacon then
-                        local age = now - data.lastPainted
-                        if age < TARGET_FADE_DURATION then
-                            local dist = data.realDist or 100  -- 无距离时假设在范围内
-                            local col = calcFadeColor(age, C.TARGET_HOT) or C.TARGET_HOT
-                            local distRatio = math_min(dist / 600.0, 1.0)  -- 用600m做参考
-                            local relBearing = getAngleDiff(data.paintedYaw or 0, effectiveHeading)
-                            targetPoolCount = targetPoolCount + 1
-                            local t = targetPool[targetPoolCount]
-                            if not t then t = {}; targetPool[targetPoolCount] = t end
-                            t.col = col
-                            t.distRatio = distRatio
-                            local screenRad = math_rad(relBearing)
-                            t.s = math_sin(screenRad)
-                            t.cs = math_cos(screenRad)
-                        end
-                    end
-                end
-            end
-
-            for _, entry in ipairs(rdrGpuList) do
-                pcall(gpuRefreshASDIC, entry, isActive, targetPoolCount, targetPool)
-            end
-            sleep(0.05)
-        end
+local function drawRadarHUD()
+    if not radarHud then return end
+    local m = radarHud.m
+    m.setTextScale(1)
+    m.setBackgroundColor(colors.black)
+    m.clear()
+    local dw, dh = m.getSize()
+    local isActive = (currentRadarRange > 0) and isServoConnected
+    local line1 = "RADAR " .. (isActive and "ONLINE" or "OFFLINE")
+    local col1 = isActive and colors.green or colors.red
+    local line2 = string.format("Range: %.0f m", currentRadarRange)
+    local line3 = "--- / ---"
+    local line4 = "---"
+    if selectedTargetId and targets[selectedTargetId] then
+        local t = targets[selectedTargetId]
+        local rel = math_floor((t.paintedYaw or 0) - currentNorthYawDeg + 0.5) % 360
+        local abs = math_floor((t.paintedYaw or 0) % 360 + 0.5) % 360
+        line3 = string.format("%.0f / %.0f", rel, abs)
+        local radSpd = t.radialSpeed or 0
+        local trend = "="
+        if radSpd > 0.1 then trend = "A" elseif radSpd < -0.1 then trend = "C" end
+        local spd = (t.speed or 0) * 3.6
+        line4 = string.format("%.1f km/h %s", spd, trend)
     end
+    local function cprint(y, text, col)
+        m.setTextColor(col)
+        m.setCursorPos(math_max(1, math_floor((dw - #text)/2) + 1), y)
+        m.write(text)
+    end
+    cprint(math_floor(dh/2)-3, line1, col1)
+    cprint(math_floor(dh/2)-1, line2, colors.yellow)
+    cprint(math_floor(dh/2)+1, line3, colors.white)
+    cprint(math_floor(dh/2)+3, line4, colors.white)
 end
 
 -- ==========================================
--- HUD 主循环
+-- 声纳 HUD 绘制
 -- ==========================================
-local function hudMonitorUI()
-    if #hudMonitorList == 0 then return end
-    local frames = 0
-    while true do
-        frames = frames + 1
-        local isFirstFrame = (frames <= 2)
-        local isActive = isAsdicActive
-
-        for _, info in ipairs(hudMonitorList) do
-            if info.mode == "STATUS" then
-                local line1, color1 = "ASDIC online", colors.green
-                if not isActive then
-                    line1, color1 = "ASDIC offline", colors.red
-                end
-                local line2 = "Range: any (debug)"
-                local line3 = "Targets: " .. targetPoolCount
-                local color3 = colors.white
-
-                if isFirstFrame or line1 ~= info.lastSText or line3 ~= info.lastLText then
-                    local m = info.m
-                    m.setTextScale(1)
-                    m.setBackgroundColor(colors.black)
-                    m.clear()
-                    local dw, dh = m.getSize()
-                    local function drawCL(txt, col, yPos)
-                        m.setTextColor(col)
-                        local sx = math_max(1, math_floor((dw - #txt) / 2) + 1)
-                        m.setCursorPos(sx, yPos)
-                        m.write(txt)
-                    end
-                    drawCL(line1, color1, math_floor(dh / 2) - 2)
-                    drawCL(line2, colors.yellow, math_floor(dh / 2))
-                    drawCL(line3, color3, math_floor(dh / 2) + 2)
-                    info.lastSText = line1
-                    info.lastLText = line3
-                end
-            end
+local function drawAsdicHUD()
+    if not asdicHud then return end
+    local m = asdicHud.m
+    m.setTextScale(1)
+    m.setBackgroundColor(colors.black)
+    m.clear()
+    local dw, dh = m.getSize()
+    local line1 = isAsdicActive and "ASDIC online" or "ASDIC offline"
+    local col1 = isAsdicActive and colors.green or colors.red
+    local line2 = string.format("Range: %d - %d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE)
+    local line3 = "Depth: --- m  /  Dist: --- m"
+    if selectedTargetId and targets[selectedTargetId] then
+        local t = targets[selectedTargetId]
+        if t.realPos then
+            line3 = string.format("Depth: %.0f m  /  Dist: %.0f m", SEA_LEVEL - t.realPos.y, t.realDist or 0)
         end
-        sleep(0.1)
     end
+    local function cprint(y, text, col)
+        m.setTextColor(col)
+        m.setCursorPos(math_max(1, math_floor((dw - #text)/2) + 1), y)
+        m.write(text)
+    end
+    cprint(math_floor(dh/2)-2, line1, col1)
+    cprint(math_floor(dh/2), line2, colors.yellow)
+    cprint(math_floor(dh/2)+2, line3, colors.white)
 end
 
 -- ==========================================
--- 终端 UI (显示最后消息)
+-- 终端 UI 三页
 -- ==========================================
 local function termUI()
     while true do
         term.setBackgroundColor(colors.black)
         term.clear()
         local w, h = term.getSize()
-
-        local tabs = {"CONFIG", "STATUS", "DEVICES"}
+        local tabs = {"PARAMS", "STATUS", "DEVICES"}
         local tabStr = ""
         for i, t in ipairs(tabs) do
             tabStr = tabStr .. (i == currentScreenTab and ("["..t.."]") or " "..t.." ") .. "  "
         end
-        term.setCursorPos(2, 1); term.setTextColor(colors.white)
+        term.setCursorPos(2,1); term.setTextColor(colors.white)
         term.write("TAB " .. tabStr)
 
         if currentScreenTab == 1 then
-            term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== PARAMETERS ===")
             local function drawInputBox(y, label, val, isSel, isEdit)
-                term.setCursorPos(2, y); term.setBackgroundColor(colors.black)
+                term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
                 term.setTextColor(isSel and colors.yellow or colors.lightGray)
                 term.write(label)
-                term.setCursorPos(22, y); term.setBackgroundColor(colors.gray)
-                local txt = (isSel and isEdit) and (inputStr .. "_") or tostring(val)
+                term.setCursorPos(22,y); term.setBackgroundColor(colors.gray)
+                local txt = (isSel and isEdit) and (inputStr.."_") or tostring(val)
                 term.setTextColor(isSel and colors.white or colors.lightGray)
                 term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
-            drawInputBox(5,  "Disp. Offset  :", yawOffset, menuIndex == 1, isEditing)
-            drawInputBox(7,  "Heading Offset:", headingOffset, menuIndex == 2, isEditing)
-            drawInputBox(9,  "Aim Precis    :", aimPrecision, menuIndex == 3, isEditing)
-            drawInputBox(11, "Scan Speed    :", string.format("%.1f deg/s", SCAN_ANGULAR_SPEED), menuIndex == 4, isEditing)
-            drawInputBox(13, "Broadcast Pos :", broadcastOwnPos and "yes" or "no", menuIndex == 5, isEditing)
+            drawInputBox(5,  "Radar DispOff :", yawOffset, menuIndex==1, isEditing)
+            drawInputBox(7,  "Radar MotorOff:", motorOffset, menuIndex==2, isEditing)
+            drawInputBox(9,  "Radar AimPrec :", aimPrecision, menuIndex==3, isEditing)
+            drawInputBox(11, "ASDIC HeadOff :", headingOffset, menuIndex==4, isEditing)
+            drawInputBox(13, "ASDIC ScnSpeed:", string.format("%.1f deg/s", ASDIC_SCAN_ANGULAR_SPEED), menuIndex==5, isEditing)
+            drawInputBox(15, "Broadcast Pos :", broadcastOwnPos and "yes" or "no", menuIndex==6, isEditing)
 
         elseif currentScreenTab == 2 then
-            term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== SYSTEM STATUS ===")
             local row = 5
-            term.setCursorPos(2, row); term.setTextColor(colors.lime)
-            term.write("Registered : " .. myLabel); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.cyan)
-            term.write(string.format("Stress     : %.0f / %.0f SU", currentStressCapacity, STRESS_THRESHOLD)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.green)
-            term.write("Camera     : ONLINE"); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.yellow)
-            term.write(string.format("Heading (raw): %.1f deg", currentNorthYawDeg)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.yellow)
-            term.write(string.format("Heading (eff): %.1f deg", (currentNorthYawDeg + headingOffset) % 360)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.white)
-            term.write(string.format("Scan Angle  : %.1f deg", scanAngle)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.white)
-            term.write(string.format("Broadcast   : %s", broadcastOwnPos and "YES" or "NO")); row = row + 1
-            local targetCount = 0
-            for _ in pairs(targets) do targetCount = targetCount + 1 end
-            term.setCursorPos(2, row); term.setTextColor(colors.lightGray)
-            term.write(string.format("Targets     : %d", targetCount)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.pink)
-            term.write("Last Msg: " .. lastRawMsg)
+            term.setCursorPos(2,row); term.setTextColor(colors.lime)
+            term.write("Registered : " .. myLabel); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write(string.format("Stress     : %.0f SU", currentStressCapacity)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.green)
+            term.write(string.format("Radar Range: %.0f m", currentRadarRange)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.white)
+            term.write(string.format("Servo Angle: %.1f deg", currentServoAngle)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.yellow)
+            term.write(string.format("Heading Raw: %.1f deg", currentNorthYawDeg)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.yellow)
+            term.write(string.format("Heading Eff: %.1f deg", (currentNorthYawDeg + headingOffset) % 360)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.white)
+            term.write(string.format("ASDIC Scan : %.1f deg", asdicScanAngle)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
+            term.write(string.format("ASDIC Active: %s", isAsdicActive and "YES" or "NO")); row = row+1
+            local tgtCount = 0
+            for _ in pairs(targets) do tgtCount = tgtCount + 1 end
+            term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
+            term.write(string.format("Targets     : %d", tgtCount)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.white)
+            term.write(string.format("Broadcast   : %s", broadcastOwnPos and "YES" or "NO"))
 
         else
-            term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== DISPLAYS ===")
             local row = 5
-            term.setCursorPos(2, row); term.setTextColor(colors.cyan)
-            term.write("[RDR GPU]"); row = row + 1
-            if #rdrGpuList == 0 then
-                term.setCursorPos(4, row); term.setTextColor(colors.red)
-                term.write("None"); row = row + 1
-            else
-                for _, e in ipairs(rdrGpuList) do
-                    term.setCursorPos(4, row); term.setTextColor(colors.lightBlue)
-                    term.write(e.name .. string.format("  [%dx%d]", e.w, e.h)); row = row + 1
-                end
-            end
-            row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.cyan)
-            term.write("[HUD Monitors]"); row = row + 1
-            if #hudMonitorList == 0 then
-                term.setCursorPos(4, row); term.setTextColor(colors.red)
-                term.write("None"); row = row + 1
-            else
-                for _, info in ipairs(hudMonitorList) do
-                    term.setCursorPos(4, row); term.setTextColor(colors.lightBlue)
-                    term.write(info.displayName .. " (" .. info.name .. ")"); row = row + 1
-                end
-            end
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("Radar GPU: " .. (radarGpu and radarGpu.name or "NONE")); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("ASDIC GPU: " .. (asdicGpu and asdicGpu.name or "NONE")); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightBlue)
+            term.write("Radar HUD: " .. (radarHud and radarHud.name or "NONE")); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightBlue)
+            term.write("ASDIC HUD: " .. (asdicHud and asdicHud.name or "NONE")); row = row+1
         end
-
         sleep(0.2)
     end
 end
@@ -718,7 +772,7 @@ local function inputLoop()
         if menuIndex == 1 then
             local p = tonumber(inputStr); if p then yawOffset = p end
         elseif menuIndex == 2 then
-            local p = tonumber(inputStr); if p then headingOffset = p end
+            local p = tonumber(inputStr); if p then motorOffset = p end
         elseif menuIndex == 3 then
             local p = tonumber(inputStr)
             if p then
@@ -726,13 +780,12 @@ local function inputLoop()
                 if p >= 1 and p <= 90 and (360 % p == 0) then aimPrecision = p end
             end
         elseif menuIndex == 4 then
-            local p = tonumber(inputStr); if p and p > 0 then SCAN_ANGULAR_SPEED = p end
+            local p = tonumber(inputStr); if p then headingOffset = p end
         elseif menuIndex == 5 then
-            if inputStr == "yes" then
-                broadcastOwnPos = true
-            elseif inputStr == "no" then
-                broadcastOwnPos = false
-            end
+            local p = tonumber(inputStr); if p and p > 0 then ASDIC_SCAN_ANGULAR_SPEED = p end
+        elseif menuIndex == 6 then
+            if inputStr == "yes" then broadcastOwnPos = true
+            elseif inputStr == "no" then broadcastOwnPos = false end
         end
         saveConfig()
         isEditing = false
@@ -752,19 +805,20 @@ local function inputLoop()
                 end
             elseif currentScreenTab == 1 then
                 if p1 == keys.up then menuIndex = math_max(1, menuIndex - 1)
-                elseif p1 == keys.down then menuIndex = math_min(5, menuIndex + 1)
+                elseif p1 == keys.down then menuIndex = math_min(6, menuIndex + 1)
                 elseif p1 == keys.enter or p1 == keys.numPadEnter then
                     isEditing = true
                     if menuIndex == 1 then inputStr = tostring(yawOffset)
-                    elseif menuIndex == 2 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 2 then inputStr = tostring(motorOffset)
                     elseif menuIndex == 3 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 4 then inputStr = tostring(SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 5 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 4 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 5 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 end
             end
         elseif event == "char" and isEditing and currentScreenTab == 1 then
-            if menuIndex == 5 then
+            if menuIndex == 6 then
                 if #inputStr < 3 then inputStr = inputStr .. p1 end
             else
                 if (p1 >= '0' and p1 <= '9') or p1 == '.' or (p1 == '-' and #inputStr == 0) then
@@ -780,19 +834,57 @@ local function inputLoop()
                 elseif touchY == 9 then ti = 3
                 elseif touchY == 11 then ti = 4
                 elseif touchY == 13 then ti = 5
+                elseif touchY == 15 then ti = 6
                 end
                 if ti then
                     if isEditing and menuIndex ~= ti then applySave() end
                     menuIndex = ti
                     isEditing = true
                     if menuIndex == 1 then inputStr = tostring(yawOffset)
-                    elseif menuIndex == 2 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 2 then inputStr = tostring(motorOffset)
                     elseif menuIndex == 3 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 4 then inputStr = tostring(SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 5 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 4 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 5 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 else
                     if isEditing then applySave() end
+                end
+            end
+        elseif (event == "tm_monitor_touch" or event == "tm_monitor_mouse_click") then
+            -- 触摸锁定：仅在雷达 GPU 上有效
+            local touchedName = p1
+            local mx, my = p2, p3
+            if radarGpu and gpuNameMap[touchedName] == radarGpu and localPos and currentRadarRange > 0 then
+                local cx, cy, r = radarGpu.cx, radarGpu.cy, radarGpu.r
+                local distFromCenter = math_sqrt((mx-cx)^2 + (my-cy)^2)
+                if distFromCenter < 5 or distFromCenter > r+10 then
+                    selectedTargetId = nil
+                else
+                    local bestId = nil
+                    local bestDist = 99999
+                    for _, data in pairs(targets) do
+                        if data.lastPainted and not data.isBeacon and data.speed and (data.speed*3.6) >= SPEED_FILTER_MIN then
+                            local yawRad = math_rad(data.paintedYaw + yawOffset)
+                            local ex = cx + math_floor(r * 0.75 * math_sin(yawRad) + 0.5)
+                            local ey = cy - math_floor(r * 0.75 * math_cos(yawRad) + 0.5)
+                            local angleToTarget = math_atan2(mx - cx, -(my - cy))
+                            local targetAngle = math_atan2(ex - cx, -(ey - cy))
+                            local angleDiff = math_abs(getAngleDiff(math_deg(angleToTarget), math_deg(targetAngle)))
+                            if angleDiff < 5 then
+                                local d2 = (mx - ex)^2 + (my - ey)^2
+                                if d2 < bestDist then
+                                    bestDist = d2
+                                    bestId = data.id
+                                end
+                            end
+                        end
+                    end
+                    if bestId then
+                        selectedTargetId = bestId
+                    else
+                        selectedTargetId = nil
+                    end
                 end
             end
         end
@@ -800,23 +892,22 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络协议
+-- 网络循环
 -- ==========================================
 local function pingLoop()
     while true do
-        if currentScreenTab == 3 then sleep(0.5)
-        else
+        if currentScreenTab == 3 then sleep(0.5) else
             if localPos and broadcastOwnPos then
                 modem.transmit(CHANNEL, CHANNEL, {
                     v = 2, t = 1, i = myId, n = myLabel,
-                    x = math_floor(localPos.x * 10) / 10,
-                    y = math_floor(localPos.y * 10) / 10,
-                    z = math_floor(localPos.z * 10) / 10,
+                    x = math_floor(localPos.x*10)/10,
+                    y = math_floor(localPos.y*10)/10,
+                    z = math_floor(localPos.z*10)/10,
                 })
             end
             local now = os_clock()
             for id, data in pairs(targets) do
-                if not data.isBeacon and id ~= selectedTargetId and data.lastSeen and (now - data.lastSeen > 10.0) then
+                if not data.isBeacon and id ~= selectedTargetId and data.lastSeen and (now - data.lastSeen > 10) then
                     targets[id] = nil
                 end
             end
@@ -825,91 +916,182 @@ local function pingLoop()
     end
 end
 
--- 监听循环：接收所有8889频道消息，立即更新目标
 local function listenLoop()
     while true do
-        local _, _, ch, _, msg, dist = os_pullEvent("modem_message")
-        if ch == LISTEN_CHANNEL then
-            -- 记录原始消息
-            if type(msg) == "table" then
-                lastRawMsg = string.format("t=%s i=%s x=%s z=%s", tostring(msg.t), tostring(msg.i), tostring(msg.x), tostring(msg.z))
-            else
-                lastRawMsg = tostring(msg)
-            end
-
-            -- 零过滤：任何表消息且含i和x就当作目标
-            if type(msg) == "table" and msg.i and msg.x then
-                local id = msg.i
-                if not targets[id] then targets[id] = {} end
-                local t = targets[id]
-                t.id = id
-                t.name = msg.n
-                t.realPos = { x = msg.x, y = msg.y or 0, z = msg.z or 0 }
-                t.lastSeen = os_clock()
-                t.isBeacon = false
-                if localPos then
-                    local cd = calcRangingDist(localPos, t.realPos)
-                    t.realDist = cd
-                end
-                -- 初次收到时设置painted，确保立即可见
-                if not t.lastPainted then
-                    t.paintedYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, t.realPos.x, t.realPos.y, t.realPos.z)
-                    t.paintedDist = t.realDist
-                    t.lastPainted = os_clock()
-                end
-            end
+        local _, _, ch, _, msg = os_pullEvent("modem_message")
+        -- 雷达频道（8888）
+        if ch == CHANNEL and type(msg) == "table" and msg.v == 2 and msg.t == 1 and msg.i ~= myId then
+            if not targets[msg.i] then targets[msg.i] = {id = msg.i} end
+            local t = targets[msg.i]
+            t.name = msg.n; t.modemDist = nil
+            if msg.x then t.realPos = {x = msg.x, y = msg.y, z = msg.z} end
+            t.lastSeen = os_clock(); t.isBeacon = false
+            if localPos and t.realPos then t.realDist = calcRangingDist(localPos, t.realPos) end
+        -- 声纳频道（8889）
+        elseif ch == ACTIVE_SONAR_CHANNEL and type(msg) == "table" and msg.v == 2 and msg.t == 1 then
+            local id = msg.i
+            if not targets[id] then targets[id] = {id = id} end
+            local t = targets[id]
+            t.name = msg.n
+            if msg.x then t.realPos = {x = msg.x, y = msg.y, z = msg.z} end
+            t.lastSeen = os_clock(); t.isBeacon = false
+            if localPos and t.realPos then t.realDist = calcRangingDist(localPos, t.realPos) end
         end
     end
 end
 
 -- ==========================================
--- 扫描解算 (摄像头仅用于航向和位置)
+-- 主传感器循环
 -- ==========================================
-local function cameraLoop()
-    scanTimeStart = os_clock()
+local function sensorLoop()
+    local lastServoAngle = nil
+    local asdicScanStart = os_clock()
     while true do
-        if currentScreenTab == 3 then sleep(0.5)
-        else
-            -- 应力检查
+        if currentScreenTab == 3 then sleep(0.5) else
+            -- 应力读取
             if cachedStressometer then
                 local ok, cap = pcall(cachedStressometer.getStressCapacity)
                 if ok then currentStressCapacity = cap or 0
                 else cachedStressometer = nil; currentStressCapacity = 0 end
             end
-            isAsdicActive = (currentStressCapacity >= STRESS_THRESHOLD)
 
-            -- 更新扫描线角度
-            local now = os_clock()
-            local elapsed = now - scanTimeStart
-            local period = 4 * SCAN_SECTOR_HALF / SCAN_ANGULAR_SPEED
-            local phase = (elapsed % period) / period
-            if phase < 0.5 then
-                scanAngle = -SCAN_SECTOR_HALF + 4 * SCAN_SECTOR_HALF * phase
-            else
-                scanAngle = SCAN_SECTOR_HALF - 4 * SCAN_SECTOR_HALF * (phase - 0.5)
+            -- 雷达伺服电机
+            if cachedServo then
+                local ok, ang = pcall(cachedServo.getAngle)
+                if ok and type(ang) == "number" then
+                    isServoConnected = true
+                    currentServoAngle = (math_deg(ang) + motorOffset) % 360
+                else
+                    isServoConnected = false; cachedServo = nil
+                end
+            else isServoConnected = false end
+
+            -- 雷达动态距离
+            local depthDynamicMax = MAX_DISTANCE_LIMIT
+            if localPos then
+                if localPos.y >= SEA_LEVEL then depthDynamicMax = 1000
+                elseif localPos.y <= -14 then depthDynamicMax = 5000
+                else depthDynamicMax = 1000 + 400 * (-localPos.y - 4) end
             end
+            currentRadarRange = math_min(currentStressCapacity / STRESS_TO_DISTANCE_RATIO, depthDynamicMax)
+
+            -- 声纳激活
+            isAsdicActive = (currentStressCapacity >= ASDIC_STRESS_THRESHOLD)
 
             -- 摄像头获取位置和航向
             if camera then
                 local ok, pos = pcall(camera.getCameraPosition)
                 if ok and pos then localPos = pos else localPos = nil end
 
-                if not isHeadless then
-                    pcall(function()
-                        currentQAbs = camera.getAbsViewTransform()
-                        currentQLoc = camera.getLocViewTransform()
-                    end)
-                    if currentQAbs and currentQLoc then
-                        local iqx, iqy, iqz, iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
-                        local hx, hy, hz = rotateVectorFast(0, 0, -1, iqx, iqy, iqz, iqw)
-                        local sx, sy, sz = rotateVectorFast(hx, hy, hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
-                        -- 修正：+180°使得0°为北
-                        currentNorthYawDeg = (math_deg(math_atan2(-sx, sz)) + 180) % 360
+                pcall(function()
+                    currentQAbs = camera.getAbsViewTransform()
+                    currentQLoc = camera.getLocViewTransform()
+                end)
+                if currentQAbs and currentQLoc then
+                    local iqx, iqy, iqz, iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                    local hx, hy, hz = rotateVectorFast(0, 0, -1, iqx, iqy, iqz, iqw)
+                    local sx, sy, sz = rotateVectorFast(hx, hy, hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                    currentNorthYawDeg = (math_deg(math_atan2(-sx, sz)) + 180) % 360
+                end
+            end
+
+            local now = os_clock()
+            -- 更新所有目标距离
+            for _, t in pairs(targets) do
+                if t.realPos and localPos then
+                    t.realDist = calcRangingDist(localPos, t.realPos)
+                end
+            end
+
+            -- 构建雷达目标池
+            radarPoolCount = 0
+            if currentRadarRange > 0 and isServoConnected and localPos then
+                local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
+                local effectiveSW = SCAN_SECTOR_WIDTH + deltaAngle
+                for id, t in pairs(targets) do
+                    if t.realPos and t.realDist and t.realDist <= currentRadarRange and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
+                        local tYaw
+                        if currentQAbs and currentQLoc then
+                            local iqx, iqy, iqz, iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                            local dx = t.realPos.x - localPos.x
+                            local dz = t.realPos.z - localPos.z
+                            local hx, hy, hz = rotateVectorFast(dx, 0, dz, iqx, iqy, iqz, iqw)
+                            local sx, sy, sz = rotateVectorFast(hx, hy, hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                            tYaw = math_deg(math_atan2(-sx, sz))
+                        else
+                            _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, t.realPos.x, t.realPos.y, t.realPos.z)
+                        end
+                        if math_abs(getAngleDiff(tYaw, currentServoAngle)) <= effectiveSW/2 then
+                            if not t.lastPaintedRadar or (now - t.lastPaintedRadar >= 0.5) then
+                                t.paintedYaw = tYaw
+                                t.paintedDist = t.realDist
+                                t.lastPaintedRadar = now
+                            end
+                            -- 加入雷达池
+                            radarPoolCount = radarPoolCount + 1
+                            local p = radarPool[radarPoolCount]
+                            if not p then p = {}; radarPool[radarPoolCount] = p end
+                            p.col = (selectedTargetId == t.id) and 0xFF0000 or 0x0000FF
+                            local rad = math_rad(tYaw + yawOffset)
+                            p.s = math_sin(rad); p.cs = math_cos(rad)
+                            p.relAngle = math_floor((tYaw - currentNorthYawDeg) % 360 + 0.5) % 360
+                        end
                     end
                 end
             end
-            sleep(0.02)
+            lastServoAngle = currentServoAngle
+
+            -- 声纳扫描线
+            local asdicElapsed = now - asdicScanStart
+            local period = 4 * ASDIC_SCAN_SECTOR_HALF / ASDIC_SCAN_ANGULAR_SPEED
+            local phase = (asdicElapsed % period) / period
+            if phase < 0.5 then
+                asdicScanAngle = -ASDIC_SCAN_SECTOR_HALF + 4 * ASDIC_SCAN_SECTOR_HALF * phase
+            else
+                asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
+            end
+
+            -- 构建声纳目标池
+            asdicPoolCount = 0
+            if isAsdicActive and localPos then
+                local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
+                for id, t in pairs(targets) do
+                    if t.realPos and t.realDist and t.realDist >= ASDIC_MIN_DISTANCE and t.realDist <= ASDIC_MAX_DISTANCE
+                        and t.realPos.y <= ASDIC_DEPTH_FILTER and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
+                        local tYaw
+                        if currentQAbs and currentQLoc then
+                            local iqx, iqy, iqz, iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
+                            local dx = t.realPos.x - localPos.x
+                            local dz = t.realPos.z - localPos.z
+                            local hx, hy, hz = rotateVectorFast(dx, 0, dz, iqx, iqy, iqz, iqw)
+                            local sx, sy, sz = rotateVectorFast(hx, hy, hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
+                            tYaw = math_deg(math_atan2(-sx, sz))
+                        else
+                            _, tYaw = calculateLookAngles(localPos.x, localPos.y, localPos.z, t.realPos.x, t.realPos.y, t.realPos.z)
+                        end
+                        local relBearing = getAngleDiff(tYaw, effectiveHeading)
+                        if math_abs(relBearing) <= ASDIC_SCAN_SECTOR_HALF then
+                            local beamHalf = ASDIC_SCAN_BEAM_WIDTH / 2
+                            if math_abs(getAngleDiff(relBearing, asdicScanAngle)) <= beamHalf then
+                                if not t.lastPaintedAsdic or (now - t.lastPaintedAsdic >= 0.5) then
+                                    t.paintedYaw = tYaw
+                                    t.paintedDist = t.realDist
+                                    t.lastPaintedAsdic = now
+                                end
+                                asdicPoolCount = asdicPoolCount + 1
+                                local p = asdicTargetPool[asdicPoolCount]
+                                if not p then p = {}; asdicTargetPool[asdicPoolCount] = p end
+                                p.col = 0xFF6600
+                                local screenRad = math_rad(relBearing)
+                                p.s = math_sin(screenRad); p.cs = math_cos(screenRad)
+                                p.distRatio = math_min(t.realDist / ASDIC_MAX_DISTANCE, 1.0)
+                            end
+                        end
+                    end
+                end
+            end
         end
+        sleep(0.02)
     end
 end
 
@@ -917,22 +1099,29 @@ end
 -- 启动信息
 -- ==========================================
 term.clear()
-term.setCursorPos(1, 1)
+term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("ASDIC v1.8.0-debug - OK")
+print("Radar+ASDIC v1.0.0 - OK")
 print(string.format("  Name      : %s", myLabel))
-print(string.format("  Stress    : %.0f SU required", STRESS_THRESHOLD))
-print(string.format("  HeadingOff: %.0f deg", headingOffset))
-print(string.format("  RDR GPU   : %d", #rdrGpuList))
-print(string.format("  HUD Mon   : %d", #hudMonitorList))
+print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
+print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
+print(string.format("  Radar GPU  : %s", radarGpu and radarGpu.name or "NONE"))
+print(string.format("  ASDIC GPU  : %s", asdicGpu and asdicGpu.name or "NONE"))
+print(string.format("  Radar HUD  : %s", radarHud and radarHud.name or "NONE"))
+print(string.format("  ASDIC HUD  : %s", asdicHud and asdicHud.name or "NONE"))
 sleep(1.0)
 
+-- ==========================================
+-- 并行启动所有协程
+-- ==========================================
 parallel.waitForAll(
-    rdrGpuUI,
-    hudMonitorUI,
+    function() while true do if radarGpu then refreshRadar(radarGpu, (currentRadarRange>0) and isServoConnected, radarPoolCount, radarPool) end sleep(0.05) end end,
+    function() while true do if asdicGpu then refreshAsdic(asdicGpu, isAsdicActive, asdicPoolCount, asdicTargetPool) end sleep(0.05) end end,
+    function() while true do drawRadarHUD() sleep(0.1) end end,
+    function() while true do drawAsdicHUD() sleep(0.1) end end,
     termUI,
     inputLoop,
     pingLoop,
     listenLoop,
-    cameraLoop
+    sensorLoop
 )
