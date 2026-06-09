@@ -1,9 +1,44 @@
+--[[雷达系统(船只端)   v2.0.0
+======================================================================
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠀⠈⠀⠀⠈⠁⠀⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⠁⠀⠀⠀⠀⠀⠀ ⠀⠀⠀⠈⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⡔⠀⠀⠀⠀⠀⠀⠀ ⠀⠀⠀⠀⠈⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠁⠀⠀⠀⠀⠀⠀⠀⠀⢀⣧⠀⠀ ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⢰⠀⠀⠀⠀⠀⠠⣶⣿⣿⡄⠀ ⠀⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠚⠛⠛⠁⠀⠀⢷⣶⣿⣿⣇⠀⠀⠈⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢹⣿⣿⠀⠀⠀⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⠁⠀⠀⡠⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡆⠀⠀⠀⠻⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠿⠟⠛⠛⠛⠉⠉⠁⠀⠀⠀⢀⣠⡾⠀⠀⠀⠀⠀⠀⠀⣠⠀⠀⢸⣿⣿⣷⠀⠀⠀⠀⠙⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⡿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⢀⣴⣿⡿⠁⠀⠀⠀⠀⠀⠀⣴⣿⡇⠀⠀⣿⣿⣿⡆⠀⠀⠀⠀⠈⢿⣿⣿⣿⣿⣿
+⣿⣿⡿⠋⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣐⣮⣵⡿⠟⠉⠀⠀⠀⠀⠀⠀⠀⣼⣿⣿⡇⠀⠀⣿⣿⣿⣿⠀⠀⠀⠀⠑⡀⠙⢿⣿⣿⣿
+⣿⡿⠀⣠⠾⠋⠀⠀⠀⢀⣠⣴⣾⣿⣿⣿⠛⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠀⠀⠀⣿⣿⣿⣿⡀⡀⠀⠀⠀⠈⠀⠀⠙⢿⣿
+⡟⠀⠀⠁⠀⠀⠀⢠⣶⣿⣿⣿⣿⣿⣿⣯⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⠀⠀⠀⢙⣛⡻⣿⣷⢸⡄⠀⠀⠀⠀⠀⠀⠀⠙
+⠁⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣯⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠈⣿⣿⢸⣿⣷⡳⠀⠀⠀⠀⠀⠀⠀⠀
+⡀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣯⠀⠀⠀⠀⠀⠰⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⠹⢋⣾⣿⣿⣿⣦⡀⠀⠀⠀⠀⠀⠀
+⡗⠀⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣆⡀⠀⠀⠀⠁⠀⠀⠀⠀⠀⠀⠀⠀⢠⣈⡁⠀⠀⠀⠀⢙⣻⣿⣿⣿⣿⣿⡄⢧⡀⠀⠀⠀
+⡇⠀⠀⠀⠀⠙⠿⣿⣿⣿⣿⡿⣿⣿⣿⣿⣿⣿⣶⣤⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣧⡀⠀⠀⢀⡐⣬⣿⣿⣿⣿⣿⣿⡘⣿⡄⠀⠀
+⡇⢠⠀⠀⠀⠀⣄⣀⣉⣭⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣾⣿⣧⣽⣿⣿⣿⣿⣿⣿⣿⣿⣿⡘⢿⠀⠀
+⣿⡌⠀⠀⠀⠀⠹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠃⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀⠀
+⣿⣿⣄⠀⠀⠀⠀⠈⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠐⠀⠀⢰⠀⠀⠨⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀
+⣿⣿⣿⣿⣦⠀⠀⠀⠀⠈⠛⠿⣿⣿⣿⣿⣿⡿⣫⣿⣿⣿⣿⣿⣧⠀⠀⠀⡀⠀⠀⠈⠛⠀⠈⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡀
+⣿⣿⣿⣿⣿⣧⡀⠈⢶⣤⣤⣀⣀⣤⣀⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣆⣀⡀⢀⠀⠀⢤⣄⠀⠀⢺⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇
+⣿⣿⣿⣿⣿⣿⣿⣶⣤⣉⠻⠿⠿⠿⢛⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡀⠀⠀⠀⠉⠆⠀⠀⢻⣿⣿⣿⣿⠏⣴⣿⣿⣿⣿⣿⣿⠁
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀⠀⠀⠀⢄⣠⣿⣿⣿⣿⣿⡀⠻⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⠀⠀⠘⣿⣿⣿⣿⣟⣿⣷⣤⣬⣉⣉
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀⢹⣿⣿⣿⣿⣦⣍⣉⠉⠉⠀
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠀⠀⠻⠛⠿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠀⠀⠀⠀⣸⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣆⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⢹⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⣀⣾⣿⣿⣿⣿⣿⣿
+======================================================================]]
+
 -- ==========================================
 --  全局配置
 -- ==========================================
 local MAX_DISTANCE_LIMIT       = 3700.0
 local STRESS_TO_DISTANCE_RATIO = 4.0
-local CHANNEL                  = 8888
+local CHANNEL                  = 8889
 local SCAN_SECTOR_WIDTH        = 20
 
 local TARGET_FADE_DURATION = 3.0
@@ -176,46 +211,6 @@ local function rotateVectorFast(vx, vy, vz, qx, qy, qz, qw)
     local ccx = qy*cz - qz*cy;  local ccy = qz*cx - qx*cz;  local ccz = qx*cy - qy*cx
     return vx+2*qw*cx+2*ccx, vy+2*qw*cy+2*ccy, vz+2*qw*cz+2*ccz
 end
--- 更新目标速度（基于当前位置和上一帧位置）
-local function updateTargetSpeed(target, now, newPos, localPos)
-    if target.lastPos and target.lastTime then
-        local dt = now - target.lastTime
-        if dt > 0.05 then
-            local dx = newPos.x - target.lastPos.x
-            local dy = newPos.y - target.lastPos.y
-            local dz = newPos.z - target.lastPos.z
-            local distance = math.sqrt(dx*dx + dy*dy + dz*dz)
-            target.speed = distance / dt   -- 速率 (m/s)
-
-            -- 计算径向速度（相对于本船）
-            if localPos then
-                local relX = newPos.x - localPos.x
-                local relY = newPos.y - localPos.y
-                local relZ = newPos.z - localPos.z
-                local relDist = math.sqrt(relX*relX + relY*relY + relZ*relZ)
-                if relDist > 0.01 then
-                    local ux = relX / relDist
-                    local uy = relY / relDist
-                    local uz = relZ / relDist
-                    local vx = dx / dt
-                    local vy = dy / dt
-                    local vz = dz / dt
-                    local radial = vx*ux + vy*uy + vz*uz
-                    target.radialSpeed = radial   -- 正：远离，负：接近
-                else
-                    target.radialSpeed = 0
-                end
-            else
-                target.radialSpeed = 0
-            end
-        end
-    else
-        target.speed = nil
-        target.radialSpeed = nil
-    end
-    target.lastPos = {x = newPos.x, y = newPos.y, z = newPos.z}
-    target.lastTime = now
-end
 local function calcRangingDist(refPos, targetPos)
     if not refPos or not targetPos then return nil end
     local dx = targetPos.x - refPos.x
@@ -223,22 +218,7 @@ local function calcRangingDist(refPos, targetPos)
     local dz = targetPos.z - refPos.z
     return math_sqrt(dx*dx + dy*dy + dz*dz)
 end
--- 速度区间字符串（km/h）
-local function speedRangeStr(speed_ms)
-    if not speed_ms then return "?" end
-    local speed_kmh = speed_ms * 3.6
-    local low = math.floor(speed_kmh / 5) * 5
-    local high = low + 5
-    return string.format("%d-%d", low, high)
-end
 
--- 接近/远离符号
-local function radialSymbol(radial_speed)
-    if not radial_speed then return "?" end
-    if radial_speed > 0.5 then return "A"
-    elseif radial_speed < -0.5 then return "C"
-    else return "=" end
-end
 -- ==========================================
 -- 颜色常量
 -- ==========================================
@@ -591,40 +571,23 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
     local r=entry.r; local ds=entry.dotSize; local half=math_floor(ds/2)
     gpuDrawRadarBase(entry)
     gpuDrawRwrArcs(entry)
-if isActive and localPos then
-    for i=1,poolCount do
-        local t=pool[i]
-        if t and t.s then
-            local targetData = t.id and targets[t.id]
-            if targetData then
-                -- 方向线终点（从中心到雷达圆内边缘，留出文字空间）
-                local lineLen = r - 12
-                local ex = cx + math_floor(lineLen * t.s + 0.5)
-                local ey = cy - math_floor(lineLen * t.cs + 0.5)
-                g.line(cx, cy, ex, ey, 0x0066FF)   -- 蓝色细线
-
-                -- 速度区间和径向符号
-                local speedStr = speedRangeStr(targetData.speed)
-                local radialSym = radialSymbol(targetData.radialSpeed)
-
-                -- 方位角（度）
-                local absBearing = (targetData.paintedYaw + 360) % 360
-                local relBearing = (absBearing - (currentNorthYawDeg or 0) + 360) % 360
-
-                -- 文本：速度区间+符号 相对方位 绝对方位
-                local text = string.format("%s%s %03d° %03d°", speedStr, radialSym, relBearing, absBearing)
-
-                -- 文本位置：沿射线方向再偏移 12 像素，并限制边界
-                local tx = ex + 12 * t.s
-                local ty = ey - 12 * t.cs
-                tx = math_max(1, math_min(entry.w - 1, tx))
-                ty = math_max(1, math_min(entry.h - 1, ty))
-                pcall(g.drawText, tx, ty, text, 0xFFFFFF, C.BG, 1)
+    if isActive and localPos then
+        for i=1,poolCount do
+            local t=pool[i]
+            if t.col and t.col~=C.BLACK then
+                local dr=r*t.r
+                local px=cx+math_floor(dr*t.s+0.5)
+                local py=cy-math_floor(dr*t.cs+0.5)
+                if (px-cx)^2+(py-cy)^2<=r*r then
+                    if t.isBeacon then
+                        gpuDrawTinyTriangle(g,px,py,t.col)
+                    else
+                        gpuFillRect(g,px-half,py-half,ds,ds,t.col)
+                    end
+                end
             end
         end
     end
-end
-
     if isActive then gpuDrawSweep(entry,currentServoAngle) end
     gpuDrawIffCorners(entry)
     g.sync()
@@ -683,7 +646,6 @@ local function rdrGpuUI()
                                 t.col=col; t.r=distRatio
                                 t.s=math_sin(yawRad); t.cs=math_cos(yawRad)
                                 t.isBeacon=false
-                                t.id=id
                             end
                         end
                     end
@@ -722,7 +684,6 @@ local function rdrGpuUI()
                         t.col=col; t.r=distRatio
                         t.s=math_sin(yawRad); t.cs=math_cos(yawRad)
                         t.isBeacon=true
-                        t.id=id
                     end
                 end
             end
@@ -761,35 +722,18 @@ local function hudMonitorUI()
                     sText="ACTIVE"; sColor=colors.green
                     rText=string.format("%dm",math_floor(currentRadarRange))
                     rColor=colors.lime
-                if selectedTargetId and targets[selectedTargetId] then
-                    local sel=targets[selectedTargetId]
-                    -- 准备速度字符串
-                    local speedStr = ""
-                    if sel.speed then
-                       local radial = ""
-                       if sel.radialSpeed then
-                          if sel.radialSpeed > 0.5 then
-                              radial = " [A]"
-                          elseif sel.radialSpeed < -0.5 then
-                              radial = " [C]"
-                          else
-                              radial = " [=]"
-                          end
-                       end
-                       speedStr = string.format(" %.0fm/s%s", sel.speed, radial)
-                    else
-                       speedStr = " ?m/s"
-                    end
-                    if sel.iff=="friendly" then
-                         lText="ALLY"; lColor=colors.green
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.green
-                    elseif sel.iff=="enemy" then
-                         lText="ENEMY"; lColor=colors.red
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.white
-                    else
-                         lText="LOCKED"; lColor=colors.yellow
-                         dText=(selectedTargetDistStr or "---") .. speedStr; dColor=colors.white
-                    end
+                    if selectedTargetId and targets[selectedTargetId] then
+                        local sel=targets[selectedTargetId]
+                        if sel.iff=="friendly" then
+                            lText="ALLY"; lColor=colors.green
+                            dText=selectedTargetDistStr or "---"; dColor=colors.green
+                        elseif sel.iff=="enemy" then
+                            lText="ENEMY"; lColor=colors.red
+                            dText=selectedTargetDistStr or "---"; dColor=colors.white
+                        else
+                            lText="LOCKED"; lColor=colors.yellow
+                            dText=selectedTargetDistStr or "---"; dColor=colors.white
+                        end
                     else
                         lText="SCAN"; lColor=colors.lightGray
                         dText="---";  dColor=colors.gray
@@ -1108,21 +1052,27 @@ local function inputLoop()
                         if dSq<=beaconSqDist then beaconSqDist=dSq; clickedBeaconId=id end
                     end
                 end
-              if clickedId then
-                 if iffMode=="friendly" then
-                    targets[clickedId].iff="friendly"
-                 else
-                    for id,data in pairs(targets) do
-                        if id~=clickedId and data.iff=="enemy" then data.iff=nil end
+                if clickedId then
+                    if iffMode=="friendly" then
+                        targets[clickedId].iff="friendly"
+                    else
+                        for id,data in pairs(targets) do
+                            if id~=clickedId and data.iff=="enemy" then data.iff=nil end
+                        end
+                        targets[clickedId].iff="enemy"
+                        selectedTargetId=clickedId
+                        selectedTargetDistStr=string.format("%dm",math_floor(bestDist+0.5))
                     end
-                    targets[clickedId].iff="enemy"
-                    selectedTargetId=clickedId
-                    selectedTargetDistStr=string.format("%dm",math_floor(bestDist+0.5))
-                 end
+                end
+                if clickedBeaconId then
+                    local bd=targets[clickedBeaconId]
+                    bd.iff=(bd.iff=="friendly") and nil or "friendly"
+                end
             end
         end
     end
 end
+
 
 -- ==========================================
 -- 网络协议
@@ -1159,16 +1109,13 @@ local function listenLoop()
         local _,_,ch,_,msg,dist=os_pullEvent("modem_message")
         if ch==CHANNEL and type(msg)=="table" and msg.v==2 then
             if msg.t==1 and msg.i~=myId then
-            if not targets[msg.i] then targets[msg.i]={} end
-            local t=targets[msg.i]
-            t.name=msg.n; t.modemDist=dist
-            local newPos = {x=msg.x, y=msg.y, z=msg.z}
-            local now = os_clock()
-            updateTargetSpeed(t, now, newPos, localPos)
-            t.realPos = newPos
-            t.range=msg.r; t.lastSeen=now; t.isBeacon=false
-            local cd=calcRangingDist(localPos,t.realPos)
-            t.realDist=cd or dist
+                if not targets[msg.i] then targets[msg.i]={} end
+                local t=targets[msg.i]
+                t.name=msg.n; t.modemDist=dist
+                t.realPos={x=msg.x,y=msg.y,z=msg.z}
+                t.range=msg.r; t.lastSeen=os_clock(); t.isBeacon=false
+                local cd=calcRangingDist(localPos,t.realPos)
+                t.realDist=cd or dist
             elseif msg.t==2 and msg.ti==myId then
                 local sid=msg.si
                 local isFriendly=(sid and targets[sid] and targets[sid].iff=="friendly")
@@ -1360,14 +1307,13 @@ local function cameraLoop()
                                     <=effectiveSW/2
                                 then
                                     data.isBeingScanned=true
-                                    if not data.lastPainted or (now-data.lastPainted>=1.0) then
-                                        local newPos = data.realPos
-                                        updateTargetSpeed(data, now, newPos, localPos)
-                                        data.paintedPos=newPos
+                                    if not data.lastPainted or
+                                        (now-data.lastPainted>=1.0)
+                                    then
+                                        data.paintedPos=data.realPos
                                         data.paintedDist=data.realDist
                                         data.paintedYaw=tYaw
                                         data.lastPainted=now
-    
                                         pcall(function()
                                             modem.transmit(CHANNEL,CHANNEL,
                                                 {v=2,t=2,si=myId,ti=id})
