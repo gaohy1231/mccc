@@ -1,15 +1,10 @@
 --[[
-ASDIC 主动声纳   v1.2.0
+ASDIC 主动声纳   v1.3.1
 改进：
-- 航向偏移可调，修正摄像头安装偏差
-- 扇形固定居中，中心线指向屏幕上方（船首）
-- N/E/S/W 字母按真实航向旋转
-- 目标点根据相对方位绘制在固定扇形上（圆点显示）
-- 扫描线无箭头，每45度虚线刻度
-- 波束检测，探测范围100-600m，深度过滤 Y<=-8
-- 应力>=10000SU 才工作
-- HUD 显示 ASDIC online/offline, 范围, 目标深度/距离
-- 网络：监听8889，可选向8888广播自身位置，锁定目标发送类型3告警
+- 彻底取消伺服电机
+- 固定扇形，旋转字母，圆点目标，扫描线无箭头
+- 终端状态页显示接收到的目标数量 (Targets)
+- 其余功能保留：双频道、应力门槛、深度/距离过滤、波束扫描、航向偏移等
 ======================================================================]]
 
 -- ==========================================
@@ -102,7 +97,7 @@ local function calcFadeColor(age, hotColor)
 end
 
 -- ==========================================
--- 运行状态
+-- 运行状态 (移除所有伺服电机相关变量)
 -- ==========================================
 local targets               = {}
 local localPos              = nil
@@ -112,10 +107,7 @@ local holdPitch, holdYaw    = nil, nil
 local selectedTargetId      = nil
 local selectedTargetDistStr = nil
 local currentQAbs, currentQLoc = nil, nil
-local currentServoAngle        = 0
-local isServoConnected         = false
 local yawOffset    = 0
-local motorOffset  = 0
 local headingOffset = 0           -- 航向偏移量
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
@@ -127,7 +119,6 @@ local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
 local cachedStressometer    = peripheral.find("Create_Stressometer")
-local cachedServo           = peripheral.find("servo")
 local targetPool            = {}
 local targetPoolCount       = 0
 local isAsdicActive         = false
@@ -147,7 +138,6 @@ local function loadConfig()
         f.close()
         if type(data) == "table" then
             if data.yawOffset    then yawOffset    = tonumber(data.yawOffset)   or 0 end
-            if data.motorOffset  then motorOffset  = tonumber(data.motorOffset) or 0 end
             if data.headingOffset then headingOffset = tonumber(data.headingOffset) or 0 end
             if data.aimPrecision then
                 local p = tonumber(data.aimPrecision)
@@ -166,7 +156,6 @@ local function saveConfig()
     local f = fs.open(CONFIG_FILE, "w")
     f.write(textutils.serialize({
         yawOffset        = yawOffset,
-        motorOffset      = motorOffset,
         headingOffset    = headingOffset,
         aimPrecision     = aimPrecision,
         monitorModes     = monitorModes,
@@ -178,7 +167,7 @@ end
 loadConfig()
 
 -- ==========================================
--- 算法函数
+-- 算法函数 (同前)
 -- ==========================================
 local function calculateLookAngles(sx, sy, sz, tx, ty, tz)
     local dx, dy, dz = tx - sx, ty - sy, tz - sz
@@ -289,14 +278,14 @@ initGpuList()
 local isHeadless = (#hudMonitorList == 0 and #rdrGpuList == 0)
 
 -- ==========================================
--- 注册检查
+-- 注册检查 (同前)
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("ASDIC v1.2.0 - Registration Check")
+    print("ASDIC v1.3.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -345,7 +334,7 @@ local function checkRegistration()
 end
 
 -- ==========================================
--- 未注册显示并停止
+-- 未注册显示并停止 (同前)
 -- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
@@ -588,8 +577,7 @@ local function rdrGpuUI()
                                     if not t then t = {}; targetPool[targetPoolCount] = t end
                                     t.col = col
                                     t.distRatio = distRatio
-                                    -- 计算屏幕上的正弦/余弦（相对方位转为屏幕角度：左负右正）
-                                    local screenRad = math_rad(relBearing)   -- 已包含左负右正
+                                    local screenRad = math_rad(relBearing)   -- 左负右正
                                     t.s = math_sin(screenRad)
                                     t.cs = math_cos(screenRad)
                                 end
@@ -662,7 +650,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (增加 headingOffset 编辑)
+-- 终端 UI (移除 Motor Offset 和 Motor Angle 显示，新增目标计数)
 -- ==========================================
 local function termUI()
     while true do
@@ -691,12 +679,12 @@ local function termUI()
                 term.write(string.format(" %-12s ", txt))
                 term.setBackgroundColor(colors.black)
             end
+            -- 菜单项共5项
             drawInputBox(5,  "Disp. Offset  :", yawOffset, menuIndex == 1, isEditing)
-            drawInputBox(7,  "Motor Offset  :", motorOffset, menuIndex == 2, isEditing)
-            drawInputBox(9,  "Heading Offset:", headingOffset, menuIndex == 3, isEditing)
-            drawInputBox(11, "Aim Precis    :", aimPrecision, menuIndex == 4, isEditing)
-            drawInputBox(13, "Scan Speed    :", string.format("%.1f deg/s", SCAN_ANGULAR_SPEED), menuIndex == 5, isEditing)
-            drawInputBox(15, "Broadcast Pos :", broadcastOwnPos and "yes" or "no", menuIndex == 6, isEditing)
+            drawInputBox(7,  "Heading Offset:", headingOffset, menuIndex == 2, isEditing)
+            drawInputBox(9,  "Aim Precis    :", aimPrecision, menuIndex == 3, isEditing)
+            drawInputBox(11, "Scan Speed    :", string.format("%.1f deg/s", SCAN_ANGULAR_SPEED), menuIndex == 4, isEditing)
+            drawInputBox(13, "Broadcast Pos :", broadcastOwnPos and "yes" or "no", menuIndex == 5, isEditing)
 
         elseif currentScreenTab == 2 then
             term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
@@ -716,6 +704,11 @@ local function termUI()
             term.write(string.format("Scan Angle  : %.1f deg", scanAngle)); row = row + 1
             term.setCursorPos(2, row); term.setTextColor(colors.white)
             term.write(string.format("Broadcast   : %s", broadcastOwnPos and "YES" or "NO")); row = row + 1
+            -- 新增：显示当前收到的目标数量
+            local targetCount = 0
+            for _ in pairs(targets) do targetCount = targetCount + 1 end
+            term.setCursorPos(2, row); term.setTextColor(colors.lightGray)
+            term.write(string.format("Targets     : %d", targetCount))
 
         else
             term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
@@ -751,25 +744,23 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环 (菜单项增至6)
+-- 输入事件循环 (菜单项调整为5项)
 -- ==========================================
 local function inputLoop()
     local function applySave()
         if menuIndex == 1 then
             local p = tonumber(inputStr); if p then yawOffset = p end
         elseif menuIndex == 2 then
-            local p = tonumber(inputStr); if p then motorOffset = p end
-        elseif menuIndex == 3 then
             local p = tonumber(inputStr); if p then headingOffset = p end
-        elseif menuIndex == 4 then
+        elseif menuIndex == 3 then
             local p = tonumber(inputStr)
             if p then
                 p = math_floor(math_abs(p))
                 if p >= 1 and p <= 90 and (360 % p == 0) then aimPrecision = p end
             end
-        elseif menuIndex == 5 then
+        elseif menuIndex == 4 then
             local p = tonumber(inputStr); if p and p > 0 then SCAN_ANGULAR_SPEED = p end
-        elseif menuIndex == 6 then
+        elseif menuIndex == 5 then
             if inputStr == "yes" then
                 broadcastOwnPos = true
             elseif inputStr == "no" then
@@ -794,20 +785,19 @@ local function inputLoop()
                 end
             elseif currentScreenTab == 1 then
                 if p1 == keys.up then menuIndex = math_max(1, menuIndex - 1)
-                elseif p1 == keys.down then menuIndex = math_min(6, menuIndex + 1)
+                elseif p1 == keys.down then menuIndex = math_min(5, menuIndex + 1)
                 elseif p1 == keys.enter or p1 == keys.numPadEnter then
                     isEditing = true
                     if menuIndex == 1 then inputStr = tostring(yawOffset)
-                    elseif menuIndex == 2 then inputStr = tostring(motorOffset)
-                    elseif menuIndex == 3 then inputStr = tostring(headingOffset)
-                    elseif menuIndex == 4 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 5 then inputStr = tostring(SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 2 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 3 then inputStr = tostring(aimPrecision)
+                    elseif menuIndex == 4 then inputStr = tostring(SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 5 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 end
             end
         elseif event == "char" and isEditing and currentScreenTab == 1 then
-            if menuIndex == 6 then
+            if menuIndex == 5 then
                 if #inputStr < 3 then inputStr = inputStr .. p1 end
             else
                 if (p1 >= '0' and p1 <= '9') or p1 == '.' or (p1 == '-' and #inputStr == 0) then
@@ -823,18 +813,16 @@ local function inputLoop()
                 elseif touchY == 9 then ti = 3
                 elseif touchY == 11 then ti = 4
                 elseif touchY == 13 then ti = 5
-                elseif touchY == 15 then ti = 6
                 end
                 if ti then
                     if isEditing and menuIndex ~= ti then applySave() end
                     menuIndex = ti
                     isEditing = true
                     if menuIndex == 1 then inputStr = tostring(yawOffset)
-                    elseif menuIndex == 2 then inputStr = tostring(motorOffset)
-                    elseif menuIndex == 3 then inputStr = tostring(headingOffset)
-                    elseif menuIndex == 4 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 5 then inputStr = tostring(SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 2 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 3 then inputStr = tostring(aimPrecision)
+                    elseif menuIndex == 4 then inputStr = tostring(SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 5 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 else
                     if isEditing then applySave() end
@@ -889,7 +877,7 @@ local function listenLoop()
 end
 
 -- ==========================================
--- 扫描解算 (航向偏移，固定扇形相对方位)
+-- 扫描解算 (不再读取伺服电机)
 -- ==========================================
 local function cameraLoop()
     scanTimeStart = os_clock()
@@ -903,20 +891,6 @@ local function cameraLoop()
                 else cachedStressometer = nil; currentStressCapacity = 0 end
             end
             isAsdicActive = (currentStressCapacity >= STRESS_THRESHOLD)
-
-            -- 伺服电机状态（不参与扫描，仅显示）
-            if cachedServo then
-                local ok, ang = pcall(cachedServo.getAngle)
-                if ok and type(ang) == "number" then
-                    isServoConnected = true
-                    currentServoAngle = (math_deg(ang) + motorOffset) % 360
-                else
-                    isServoConnected = false
-                    cachedServo = nil
-                end
-            else
-                isServoConnected = false
-            end
 
             -- 更新扫描线角度
             local now = os_clock()
@@ -1022,7 +996,7 @@ end
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.green)
-print("ASDIC v1.2.0 - OK")
+print("ASDIC v1.3.1 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Range     : %.0f - %.0f m", MIN_DISTANCE, MAX_DISTANCE))
 print(string.format("  Stress    : %.0f SU required", STRESS_THRESHOLD))
