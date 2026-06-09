@@ -1,10 +1,9 @@
 --[[
-ASDIC 主动声纳 v1.5.0-debug (通信调试版)
-- 终端实时打印所有 8889 频道消息
-- 放宽目标过滤，只要消息含 x 和 i 就处理
-- 状态页显示最后收到消息的原始内容
-- 其余功能保留：扇形、扫描线、航向偏移等
-使用方法：保存为 .lua 运行，观察终端输出。
+ASDIC 主动声纳 v1.6.1
+修正：
+- 修复船首航向计算偏移（加180°归一化），现在Heading(raw)正确反映真北0°方向
+- 摄像头不再跟踪目标，仅用于获取位置和航向
+- 其余功能不变：固定扇形、扫描线、波束扫描、应力门槛、网络监听等
 ======================================================================]]
 
 -- ==========================================
@@ -13,18 +12,18 @@ ASDIC 主动声纳 v1.5.0-debug (通信调试版)
 local MIN_DISTANCE = 100.0
 local MAX_DISTANCE = 600.0
 local STRESS_THRESHOLD = 10000.0
-local CHANNEL = 8888
-local LISTEN_CHANNEL = 8889
-local SCAN_SECTOR_HALF = 90
-local SCAN_BEAM_WIDTH = 20          -- 恢复为正常波束宽度，便于测试真实扫描
-local SEA_LEVEL = -4
-local DEPTH_FILTER = -8
+local CHANNEL = 8888                -- 广播自身位置频道
+local LISTEN_CHANNEL = 8889         -- 监听水听位置频道
+local SCAN_SECTOR_HALF = 90         -- 扇形半角 (总180度)
+local SCAN_BEAM_WIDTH = 20          -- 扫描线波束宽度
+local SEA_LEVEL = -4                -- 海平面 Y 坐标
+local DEPTH_FILTER = -8             -- 深度过滤 Y > -8 不显示
 
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local REG_QUERY_TIMEOUT = 5.0
 
-local SCAN_ANGULAR_SPEED = 30.0
+local SCAN_ANGULAR_SPEED = 30.0     -- 默认扫描角速度 (度/秒)
 
 -- ==========================================
 -- 外设初始化
@@ -44,11 +43,8 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 if not camera then error("Camera not found!", 0) end
 
+-- 不再需要 applyCameraAngle，保留备用但永不调用
 local HAS_FORCE_API = (camera.forcePitchYaw ~= nil)
-local function applyCameraAngle(p, y)
-    if HAS_FORCE_API then camera.forcePitchYaw(p, y)
-    else camera.setPitch(p); camera.setYaw(y) end
-end
 
 redstone.setOutput("front", false)
 
@@ -97,13 +93,10 @@ local function calcFadeColor(age, hotColor)
 end
 
 -- ==========================================
--- 运行状态
+-- 运行状态 (移除摄像头跟踪相关变量)
 -- ==========================================
 local targets               = {}
 local localPos              = nil
-local trackedTargetId       = nil
-local isTargetInRange       = false
-local holdPitch, holdYaw    = nil, nil
 local selectedTargetId      = nil
 local selectedTargetDistStr = nil
 local currentQAbs, currentQLoc = nil, nil
@@ -113,8 +106,8 @@ local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
-local currentNorthYawDeg    = 0
-local currentScreenTab      = 1
+local currentNorthYawDeg    = 0      -- 摄像头航向 (修正后0°=北)
+local currentScreenTab      = 1      -- 1=配置, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
@@ -124,11 +117,9 @@ local targetPoolCount       = 0
 local isAsdicActive         = false
 local broadcastOwnPos       = false
 
+-- 扫描摇摆状态
 local scanTimeStart = 0
 local scanAngle = 0
-
--- 调试用：记录最后收到的原始消息
-local lastRawMsg = "None"
 
 -- ==========================================
 --  配置文件
@@ -280,14 +271,14 @@ initGpuList()
 local isHeadless = (#hudMonitorList == 0 and #rdrGpuList == 0)
 
 -- ==========================================
--- 注册检查 (完整)
+-- 注册检查
 -- ==========================================
 local function checkRegistration()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("ASDIC v1.5.0-debug - Registration Check")
+    print("ASDIC v1.6.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -336,7 +327,7 @@ local function checkRegistration()
 end
 
 -- ==========================================
--- 未注册显示并停止 (完整)
+-- 未注册显示并停止
 -- ==========================================
 local function showNotRegisteredAndHalt()
     for _, entry in ipairs(rdrGpuList) do
@@ -432,7 +423,7 @@ print("Registration OK. Starting ASDIC...")
 sleep(0.5)
 
 -- ==========================================
--- GPU 绘制辅助 (固定扇形)
+-- GPU 绘制辅助 (固定扇形，修正后的航向)
 -- ==========================================
 local function gpuDrawFixedSector(entry)
     local g = entry.gpu
@@ -486,6 +477,7 @@ local function gpuDrawFixedSector(entry)
         end
     end
 
+    -- 使用修正后的航向计算字母位置
     local trueHeading = (currentNorthYawDeg + headingOffset) % 360
     local dirs = {
         {angle=0,   label="N"},
@@ -644,7 +636,7 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI (显示最后消息)
+-- 终端 UI
 -- ==========================================
 local function termUI()
     while true do
@@ -700,9 +692,7 @@ local function termUI()
             local targetCount = 0
             for _ in pairs(targets) do targetCount = targetCount + 1 end
             term.setCursorPos(2, row); term.setTextColor(colors.lightGray)
-            term.write(string.format("Targets     : %d", targetCount)); row = row + 1
-            term.setCursorPos(2, row); term.setTextColor(colors.pink)
-            term.write("Last Msg: " .. lastRawMsg)
+            term.write(string.format("Targets     : %d", targetCount))
 
         else
             term.setCursorPos(2, 3); term.setTextColor(colors.yellow)
@@ -852,39 +842,26 @@ local function pingLoop()
     end
 end
 
--- 监听循环：记录并显示所有消息
 local function listenLoop()
     while true do
         local _, _, ch, _, msg, dist = os_pullEvent("modem_message")
-        if ch == LISTEN_CHANNEL then
-            -- 记录原始消息内容
-            if type(msg) == "table" then
-                lastRawMsg = string.format("t=%s i=%s x=%s z=%s", tostring(msg.t), tostring(msg.i), tostring(msg.x), tostring(msg.z))
-            else
-                lastRawMsg = tostring(msg)
-            end
-
-            -- 放宽条件：只要消息含 x 和 i 就尝试处理
-            if type(msg) == "table" and msg.x and msg.i then
-                local id = msg.i
-                if not targets[id] then targets[id] = {} end
-                local t = targets[id]
-                t.id = id
-                t.name = msg.n
-                t.realPos = { x = msg.x, y = msg.y or 0, z = msg.z or 0 }
-                t.lastSeen = os_clock()
-                t.isBeacon = false
-                if localPos then
-                    local cd = calcRangingDist(localPos, t.realPos)
-                    t.realDist = cd
-                end
-            end
+        if ch == LISTEN_CHANNEL and type(msg) == "table" and msg.v == 2 and msg.t == 1 then
+            local id = msg.i
+            if not targets[id] then targets[id] = {} end
+            local t = targets[id]
+            t.id = id
+            t.name = msg.n
+            t.realPos = { x = msg.x, y = msg.y, z = msg.z }
+            t.lastSeen = os_clock()
+            t.isBeacon = false
+            local cd = calcRangingDist(localPos, t.realPos)
+            t.realDist = cd
         end
     end
 end
 
 -- ==========================================
--- 扫描解算
+-- 扫描解算 (不再控制摄像头)
 -- ==========================================
 local function cameraLoop()
     scanTimeStart = os_clock()
@@ -910,6 +887,7 @@ local function cameraLoop()
                 scanAngle = SCAN_SECTOR_HALF - 4 * SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
+            -- 摄像头获取位置和航向
             if camera then
                 local ok, pos = pcall(camera.getCameraPosition)
                 if ok and pos then localPos = pos else localPos = nil end
@@ -923,13 +901,15 @@ local function cameraLoop()
                         local iqx, iqy, iqz, iqw = quatInverse(currentQAbs.x, currentQAbs.y, currentQAbs.z, currentQAbs.w)
                         local hx, hy, hz = rotateVectorFast(0, 0, -1, iqx, iqy, iqz, iqw)
                         local sx, sy, sz = rotateVectorFast(hx, hy, hz, currentQLoc.x, currentQLoc.y, currentQLoc.z, currentQLoc.w)
-                        currentNorthYawDeg = math_deg(math_atan2(-sx, sz))
+                        -- 修正：加180°，使得0°为北
+                        currentNorthYawDeg = (math_deg(math_atan2(-sx, sz)) + 180) % 360
                     end
                 end
 
                 local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                 local refPos = localPos
                 if isAsdicActive and refPos then
+                    -- 更新距离
                     for _, data in pairs(targets) do
                         if data.realPos and not data.isBeacon then
                             local cd = calcRangingDist(refPos, data.realPos)
@@ -940,6 +920,7 @@ local function cameraLoop()
                     local beamHalf = SCAN_BEAM_WIDTH / 2
                     for id, data in pairs(targets) do
                         if data.isBeacon then goto continue end
+                        data.isBeingScanned = false
                         if data.realPos and data.realDist and
                            data.realDist >= MIN_DISTANCE and data.realDist <= MAX_DISTANCE and
                            data.realPos.y <= DEPTH_FILTER and
@@ -974,10 +955,6 @@ local function cameraLoop()
                                         y = math_floor(localPos.y * 10) / 10,
                                         z = math_floor(localPos.z * 10) / 10,
                                     })
-                                    if id == selectedTargetId then
-                                        local depth = SEA_LEVEL - data.realPos.y
-                                        selectedTargetDistStr = string.format("%.0f m / %.0f m", depth, data.realDist)
-                                    end
                                 end
                             end
                         end
@@ -996,11 +973,11 @@ end
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.green)
-print("ASDIC v1.5.0-debug - OK")
+print("ASDIC v1.6.1 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Range     : %.0f - %.0f m", MIN_DISTANCE, MAX_DISTANCE))
 print(string.format("  Stress    : %.0f SU required", STRESS_THRESHOLD))
-print(string.format("  Beam Width: %d deg", SCAN_BEAM_WIDTH))
+print(string.format("  Scan Speed: %.1f deg/s", SCAN_ANGULAR_SPEED))
 print(string.format("  HeadingOff: %.0f deg", headingOffset))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
 print(string.format("  HUD Mon   : %d", #hudMonitorList))
