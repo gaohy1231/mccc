@@ -1132,9 +1132,6 @@ local function pingLoop()
                 msg8889.y = math_floor(localPos.y*10)/10
                 msg8889.z = math_floor(localPos.z*10)/10
                 modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, msg8889)
-
-                -- 调试打印
-                print("Sent 8889: x=" .. msg8889.x .. " z=" .. msg8889.z)
             end
             local now=os_clock()
             for id,data in pairs(targets) do
