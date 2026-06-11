@@ -1,17 +1,16 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.0.0 (完全还原雷达原版 + 声纳独立)
-- 雷达：100% 恢复原始雷达 v2.0.0 的全部功能（圆点目标、IFF角标、信标、HUD IFF角标、RWR红石、后背切换IFF、摄像头跟踪等）
-- 主动声纳：固定扇形、软件扫描、外圈字母旋转、触摸锁定、频道隔离、淡出效果、独立航向修正
-- 终端 UI 四页：雷达参数、声纳参数、系统状态、设备分配
-- 雷达和声纳的航向修正参数完全独立
-- 所有细节均按原始雷达实现
+雷达 + 主动声纳 二合一系统   v4.0.1
+修复：
+- 雷达目标现在能正常显示（修复 listenLoop 中 source 未更新的 bug）
+- 雷达有效探测距离公式恢复为：min(应力/换算比, 授权最大距离)
+- 其余功能同 v4.0.0
 ======================================================================]]
 
 -- ==========================================
 --  全局配置（雷达原版参数）
 -- ==========================================
-local MAX_DISTANCE_LIMIT       = 5000.0
-local STRESS_TO_DISTANCE_RATIO = 2.0
+local MAX_DISTANCE_LIMIT       = 5000.0          -- 最大探测距离（可由注册机覆盖）
+local STRESS_TO_DISTANCE_RATIO = 2.0             -- 应力到距离的转换比
 local CHANNEL                  = 8888
 local ACTIVE_SONAR_CHANNEL     = 8889
 local SCAN_SECTOR_WIDTH        = 20
@@ -170,7 +169,6 @@ local ROLE_LABELS = {
     asdicHud = "ASDIC HUD"
 }
 
--- 收集外设
 for _, name in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(name)
     if ptype == "tm_gpu" then table.insert(allGpus, name)
@@ -216,7 +214,6 @@ local function applyDeviceMap()
         if role == "radarHud" then radarHud = peripheral.wrap(name); radarHud.setTextScale(1)
         elseif role == "asdicHud" then asdicHud = peripheral.wrap(name); asdicHud.setTextScale(1) end
     end
-    -- 自动分配未指定的
     if not radarGpu and #allGpus >= 1 and not deviceMap[allGpus[1]] then
         deviceMap[allGpus[1]] = "radarGpu"; radarGpu = peripheral.wrap(allGpus[1])
     end
@@ -317,7 +314,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.0.0 - Registration Check")
+    print("Radar+ASDIC v4.0.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -451,7 +448,7 @@ print("Registration OK. Starting system...")
 sleep(0.5)
 
 -- ==========================================
--- 雷达 GPU 绘制函数（完整原版）
+-- 雷达颜色常量（原版）
 -- ==========================================
 local C = {
     BG          = 0x050A05,
@@ -474,6 +471,9 @@ local C = {
     UNREG_BG    = 0x1A0000,
 }
 
+-- ==========================================
+-- 雷达 GPU 绘制函数（完整原版）
+-- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
     while x >= y do
@@ -635,8 +635,7 @@ local function drawAsdicSector(entry)
             end
         end
     end
-    -- 声纳使用独立航向
-    local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360  -- 修正为0°北
+    local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360  -- 修正为北
     local dirs = {
         {angle=0,   label="N"},
         {angle=90,  label="E"},
@@ -1027,7 +1026,6 @@ local function inputLoop()
                     if isEditing then applyAsdicSave() end
                 end
             elseif currentScreenTab == 4 then
-                -- 设备页点击
                 if touchY >= 6 and touchY < 6 + #allGpus then
                     local idx = touchY - 5
                     if idx > 0 and idx <= #allGpus then
@@ -1044,12 +1042,11 @@ local function inputLoop()
             end
         elseif (event == "tm_monitor_touch" or event == "tm_monitor_mouse_click") and currentScreenTab <= 3 then
             local touchedName = p1; local mx, my = p2, p3
-            -- 雷达触摸
             if radarGpu and peripheral.getName(radarGpu) == touchedName and localPos and currentRadarRange > 0 and radarEnabled and isServoConnected then
                 local w, h = radarGpu.getSize()
                 local cx, cy = math_floor(w/2), math_floor(h/2)
                 local r = math_floor(math_min(cx, cy) * 0.88)
-                local ds = 4 -- 匹配雷达点大小，简化计算
+                local ds = 4
                 if r < 80 then ds = 3 end
                 if r < 50 then ds = 2 end
                 local minSqDist = (math_max(ds*3, r*0.04))^2
@@ -1069,7 +1066,6 @@ local function inputLoop()
                         end
                     end
                 end
-                -- 信标点击
                 local clickedBeaconId = nil; local beaconSqDist = 16
                 for id, data in pairs(targets) do
                     if data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
@@ -1110,7 +1106,6 @@ local function inputLoop()
                     local bd = targets[clickedBeaconId]
                     bd.iff = (bd.iff == "friendly") and nil or "friendly"
                 end
-            -- 声纳触摸
             elseif asdicGpu and peripheral.getName(asdicGpu) == touchedName and localPos and isAsdicActive then
                 local w, h = asdicGpu.getSize()
                 local cx, cy = math_floor(w/2), math_floor(h/2)
@@ -1140,7 +1135,7 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络循环
+-- 网络循环（修复 source 更新问题）
 -- ==========================================
 local function pingLoop()
     while true do
@@ -1172,8 +1167,9 @@ local function listenLoop()
         local _,_,ch,_,msg,dist = os_pullEvent("modem_message")
         if ch == CHANNEL and type(msg)=="table" and msg.v==2 and msg.i~=myId then
             if msg.t==1 then
-                if not targets[msg.i] then targets[msg.i]={id=msg.i, source=8888} end
+                if not targets[msg.i] then targets[msg.i]={id=msg.i} end
                 local t = targets[msg.i]
+                t.source = 8888   -- 强制设置为雷达频道
                 t.name=msg.n; t.modemDist=dist
                 if msg.x then t.realPos={x=msg.x,y=msg.y,z=msg.z} end
                 t.range=msg.r; t.lastSeen=os_clock(); t.isBeacon=false
@@ -1213,6 +1209,7 @@ local function listenLoop()
                 local key=tostring(beaconId).."_"..beaconUid
                 if not targets[key] then targets[key]={} end
                 local t=targets[key]
+                t.source = 8888   -- 信标也属雷达频道
                 t.name=tostring(msg.n or ("Beacon-"..beaconId))
                 t.modemDist=dist
                 t.realPos={x=msg.x,y=msg.y,z=msg.z}
@@ -1223,9 +1220,9 @@ local function listenLoop()
             end
         elseif ch == ACTIVE_SONAR_CHANNEL and type(msg)=="table" and msg.v==2 and msg.t==1 then
             local id = msg.i
-            if not targets[id] then targets[id] = {id=id, source=8889} end
+            if not targets[id] then targets[id] = {id=id} end
             local t = targets[id]
-            t.source = 8889
+            t.source = 8889   -- 强制设置为声纳频道
             t.name = msg.n
             if msg.x then t.realPos = {x=msg.x, y=msg.y, z=msg.z} end
             t.lastSeen = os_clock(); t.isBeacon = false
@@ -1264,7 +1261,7 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 主传感器循环（雷达+声纳）
+-- 主传感器循环（雷达距离公式恢复）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1288,13 +1285,9 @@ local function sensorLoop()
                 end
             else isServoConnected = false end
 
-            local depthDynamicMax = MAX_DISTANCE_LIMIT
-            if localPos then
-                if localPos.y >= SEA_LEVEL then depthDynamicMax = 1000
-                elseif localPos.y <= -14 then depthDynamicMax = 5000
-                else depthDynamicMax = 1000 + 400 * (-localPos.y - 4) end
-            end
-            currentRadarRange = math_min(currentStressCapacity / STRESS_TO_DISTANCE_RATIO, depthDynamicMax)
+            -- 雷达有效距离公式：min(应力/换算比, 授权最大距离)
+            currentRadarRange = math_min(currentStressCapacity / STRESS_TO_DISTANCE_RATIO, MAX_DISTANCE_LIMIT)
+
             isAsdicActive = (currentStressCapacity >= ASDIC_STRESS_THRESHOLD)
 
             -- 摄像头
@@ -1309,7 +1302,7 @@ local function sensorLoop()
                     local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
                     local hx,hy,hz = rotateVectorFast(0,0,-1,iqx,iqy,iqz,iqw)
                     local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                    currentNorthYawDeg = math_deg(math_atan2(-sx,sz))   -- 雷达用原始
+                    currentNorthYawDeg = math_deg(math_atan2(-sx,sz))
                 end
             end
 
@@ -1318,7 +1311,7 @@ local function sensorLoop()
                 if t.realPos and localPos then t.realDist = calcRangingDist(localPos, t.realPos) end
             end
 
-            -- 雷达目标池（完整原版逻辑）
+            -- 雷达目标池（只包含 source==8888 的目标）
             radarPoolCount = 0
             if radarEnabled and currentRadarRange > 0 and isServoConnected and localPos then
                 local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
@@ -1341,7 +1334,6 @@ local function sensorLoop()
                                 t.paintedYaw = tYaw
                                 t.paintedDist = t.realDist
                                 t.lastPaintedRadar = now
-                                -- 雷达锁定告警
                                 if selectedTargetId == t.id and t.iff == "enemy" then
                                     modem.transmit(CHANNEL, CHANNEL, {v=2, t=2, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
                                 end
@@ -1431,10 +1423,10 @@ local function sensorLoop()
                 asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
-            -- 声纳目标池
+            -- 声纳目标池（只包含 source==8889 的目标）
             asdicPoolCount = 0
             if isAsdicActive and localPos then
-                local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360  -- 修正为北
+                local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
                 for id, t in pairs(targets) do
                     if t.source == 8889 and t.realPos and t.realDist and t.realDist >= ASDIC_MIN_DISTANCE and t.realDist <= ASDIC_MAX_DISTANCE
                         and t.realPos.y <= ASDIC_DEPTH_FILTER and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
@@ -1454,7 +1446,7 @@ local function sensorLoop()
                             local beamHalf = ASDIC_SCAN_BEAM_WIDTH / 2
                             if math_abs(getAngleDiff(relBearing, asdicScanAngle)) <= beamHalf then
                                 if not t.lastPaintedAsdic or (now - t.lastPaintedAsdic >= 0.5) then
-                                    t.paintedYaw = relBearing  -- 相对方位
+                                    t.paintedYaw = relBearing
                                     t.paintedDist = t.realDist
                                     t.lastPaintedAsdic = now
                                     modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, {v=2, t=3, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
@@ -1486,7 +1478,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.0.0 - OK")
+print("Radar+ASDIC v4.0.1 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
