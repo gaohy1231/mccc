@@ -1,11 +1,8 @@
 --[[
-雷达 + 主动声纳 二合一系统   v2.2.0
-改进：
-- 主动声纳屏幕支持触摸/点击锁定目标
-- 目标淡出时间在雷达和声纳上同时生效
-- 雷达只显示 8888 频道目标，声纳只显示 8889 频道目标
-- 修复声纳船首航向与真实航向的对称偏差（新增 headingOffset 校准）
-- 其余功能同 v2.1.0（参数编辑、三页 UI、雷达开关等）
+雷达 + 主动声纳 二合一系统   v2.2.1
+修正：
+- 修复主动声纳目标相对方位的对称偏差（直接使用摄像头偏航角作为相对方位）
+- 其余功能同 v2.2.0
 ======================================================================]]
 
 -- ==========================================
@@ -151,7 +148,7 @@ local iffMode   = "enemy"
 local rwrEvents = {}
 
 -- ==========================================
---  GPU / HUD 分配（自动取前两个）
+--  GPU / HUD 分配
 -- ==========================================
 local radarGpu = nil
 local asdicGpu = nil
@@ -295,7 +292,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v2.2.0 - Registration Check")
+    print("Radar+ASDIC v2.2.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -627,7 +624,7 @@ local function refreshAsdic(entry, isActive, poolCount, pool)
     drawAsdicSector(entry)
     for i = 1, poolCount do
         local t = pool[i]
-        if t and t.col and t.col ~= 0x000000 then  -- 淡出效果
+        if t and t.col and t.col ~= 0x000000 then
             local px = entry.cx + math_floor(entry.r * t.distRatio * t.s + 0.5)
             local py = entry.cy - math_floor(entry.r * t.distRatio * t.cs + 0.5)
             g.line(px, py, px, py, t.col)
@@ -952,10 +949,10 @@ local function inputLoop()
                 else
                     local bestId = nil
                     local bestDist = 99999
-                    local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                     for _, data in pairs(targets) do
                         if data.lastPaintedAsdic and not data.isBeacon and data.source == 8889 then
-                            local relBearing = getAngleDiff(data.paintedYaw, effectiveHeading)
+                            -- 直接使用存储的 relBearing（摄像头偏航角）
+                            local relBearing = data.paintedYaw  -- 已经是相对船首的角度
                             local screenRad = math_rad(relBearing)
                             local distRatio = math_min(data.realDist / ASDIC_MAX_DISTANCE, 1.0)
                             local ex = cx + math_floor(r * distRatio * math_sin(screenRad) + 0.5)
@@ -1071,7 +1068,7 @@ local function rwrRedstoneLoop()
 end
 
 -- ==========================================
--- 主传感器循环（雷达+声纳，频道隔离）
+-- 主传感器循环（雷达+声纳，修复声纳相对方位）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1213,10 +1210,9 @@ local function sensorLoop()
                 asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
-            -- 声纳目标池（仅 8889 频道）
+            -- 声纳目标池（仅 8889 频道，直接使用摄像头偏航角作为相对方位）
             asdicPoolCount = 0
             if isAsdicActive and localPos then
-                local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                 for id, t in pairs(targets) do
                     if t.source == 8889 and t.realPos and t.realDist and t.realDist >= ASDIC_MIN_DISTANCE and t.realDist <= ASDIC_MAX_DISTANCE
                         and t.realPos.y <= ASDIC_DEPTH_FILTER and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
@@ -1227,16 +1223,18 @@ local function sensorLoop()
                             local dz = t.realPos.z - localPos.z
                             local hx,hy,hz = rotateVectorFast(dx, 0, dz, iqx,iqy,iqz,iqw)
                             local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                            tYaw = math_deg(math_atan2(-sx,sz))
+                            tYaw = math_deg(math_atan2(-sx,sz))  -- 摄像头偏航角，右正左负，-180..180
                         else
                             _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, t.realPos.x,t.realPos.y,t.realPos.z)
                         end
-                        local relBearing = getAngleDiff(tYaw, effectiveHeading)
+                        -- 直接使用 tYaw 作为相对本船方位角
+                        local relBearing = tYaw
+                        -- 检查是否在扇形内
                         if math_abs(relBearing) <= ASDIC_SCAN_SECTOR_HALF then
                             local beamHalf = ASDIC_SCAN_BEAM_WIDTH / 2
                             if math_abs(getAngleDiff(relBearing, asdicScanAngle)) <= beamHalf then
                                 if not t.lastPaintedAsdic or (now - t.lastPaintedAsdic >= 0.5) then
-                                    t.paintedYaw = tYaw
+                                    t.paintedYaw = relBearing  -- 存储相对方位（与水听器一致）
                                     t.paintedDist = t.realDist
                                     t.lastPaintedAsdic = now
                                     modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, {v=2, t=3, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
@@ -1268,7 +1266,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v2.2.0 - OK")
+print("Radar+ASDIC v2.2.1 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
