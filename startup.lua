@@ -1,29 +1,26 @@
 --[[
-雷达 + 主动声纳 二合一系统   v2.0.3
-- 雷达：完全恢复原始雷达 v2.0.0 所有功能（圆点目标、绿色扫描线、IFF、RWR、后背红石切换、摄像头跟踪等）
-- 主动声纳：固定扇形，软件扫描，外圈字母旋转，目标圆点，发送类型3 RWR告警
-- 终端 UI 三页：参数(含雷达开关)、状态、设备
-- 雷达开关控制雷达启用/禁用，声纳独立运行
-- 雷达航向：伺服电机角度 (currentServoAngle + motorOffset)
-- 声纳航向：使用雷达伺服角度 (currentServoAngle + motorOffset)，扇形固定
-- 网络：雷达监听 8888，声纳监听 8889，声纳锁定目标时向8889发送类型3消息
-- 注意：需要至少两个 GPU 显示器、两个普通显示器
+雷达 + 主动声纳 二合一系统   v2.1.0
+改进：
+- 主动声纳船首航向改为摄像头固定航向 (currentNorthYawDeg + headingOffset)
+- 参数页支持编辑（键盘/鼠标交互）
+- 参数页增加 Heading Offset 可编辑项
+- 雷达部分保持原样（伺服扫描、IFF、RWR、摄像头跟踪）
 ======================================================================]]
 
 -- ==========================================
 --  全局配置（雷达原版参数）
 -- ==========================================
-local MAX_DISTANCE_LIMIT       = 5000.0          -- 可由注册机覆盖
+local MAX_DISTANCE_LIMIT       = 5000.0
 local STRESS_TO_DISTANCE_RATIO = 2.0
-local CHANNEL                  = 8888            -- 雷达网络频道
-local ACTIVE_SONAR_CHANNEL     = 8889            -- 声纳监听频道
-local SCAN_SECTOR_WIDTH        = 20              -- 雷达扫描扇区宽度
+local CHANNEL                  = 8888
+local ACTIVE_SONAR_CHANNEL     = 8889
+local SCAN_SECTOR_WIDTH        = 20
 local SEA_LEVEL                = -4
 
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local RWR_ARC_DURATION     = 1.0
-local SPEED_FILTER_MIN     = 4.0               -- km/h (雷达速度过滤已弃用，保留占位)
+local SPEED_FILTER_MIN     = 4.0   -- 保留占位，但不再使用
 
 -- 主动声纳参数
 local ASDIC_MIN_DISTANCE    = 100.0
@@ -121,12 +118,13 @@ local currentServoAngle        = 0
 local isServoConnected         = false
 local yawOffset    = 0
 local motorOffset  = 0
+local headingOffset = 0           -- 声纳航向偏移（新增）
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
-local currentNorthYawDeg    = 0      -- 摄像头航向（仅用于雷达N标记）
+local currentNorthYawDeg    = 0      -- 摄像头航向（0°北顺时针）
 local currentScreenTab      = 1      -- 1=参数, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
@@ -134,8 +132,8 @@ local inputStr              = ""
 local cachedStressometer    = peripheral.find("Create_Stressometer")
 local cachedServo           = peripheral.find("servo")
 
-local radarEnabled = true           -- 雷达开关
-local broadcastOwnPos = false       -- 声纳广播自身位置开关（当前未使用）
+local radarEnabled = true
+local broadcastOwnPos = false
 
 -- 雷达目标池
 local radarPool      = {}
@@ -152,7 +150,7 @@ local iffMode   = "enemy"
 local rwrEvents = {}
 
 -- ==========================================
---  GPU / HUD 分配（自动取前两个）
+--  GPU / HUD 分配
 -- ==========================================
 local radarGpu = nil
 local asdicGpu = nil
@@ -164,7 +162,6 @@ local gpuNameMap = {}
 local hudMonitorList = {}
 
 local function initPeripherals()
-    -- 分配 GPU
     local gpuIdx = 0
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "tm_gpu" then
@@ -196,7 +193,6 @@ local function initPeripherals()
         end
     end
 
-    -- 分配 HUD
     local monIdx = 0
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "monitor" then
@@ -263,6 +259,7 @@ local function loadConfig()
         if type(data) == "table" then
             if data.yawOffset    then yawOffset    = tonumber(data.yawOffset)   or 0 end
             if data.motorOffset  then motorOffset  = tonumber(data.motorOffset) or 0 end
+            if data.headingOffset then headingOffset = tonumber(data.headingOffset) or 0 end
             if data.aimPrecision then
                 local p = tonumber(data.aimPrecision)
                 if p and p >= 1 and p <= 90 and (360 % math_floor(p) == 0) then
@@ -278,11 +275,12 @@ end
 local function saveConfig()
     local f = fs.open(CONFIG_FILE, "w")
     f.write(textutils.serialize({
-        yawOffset    = yawOffset,
-        motorOffset  = motorOffset,
-        aimPrecision = aimPrecision,
-        monitorModes = monitorModes,
-        radarEnabled = radarEnabled,
+        yawOffset     = yawOffset,
+        motorOffset   = motorOffset,
+        headingOffset = headingOffset,
+        aimPrecision  = aimPrecision,
+        monitorModes  = monitorModes,
+        radarEnabled  = radarEnabled,
     }))
     f.close()
 end
@@ -296,7 +294,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v2.0.3 - Registration Check")
+    print("Radar+ASDIC v2.1.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -437,7 +435,7 @@ print("Registration OK. Starting system...")
 sleep(0.5)
 
 -- ==========================================
--- 雷达 GPU 绘制函数（完全按照原始雷达）
+-- 雷达 GPU 绘制（原版）
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -496,7 +494,7 @@ local function gpuDrawSweep(entry,angleDeg)
     local rad=math_rad(angleDeg+yawOffset)
     local ex=cx+math_floor(r*math_sin(rad)+0.5)
     local ey=cy-math_floor(r*math_cos(rad)+0.5)
-    g.line(cx,cy,ex,ey,0x00FF66)   -- 绿色，无箭头
+    g.line(cx,cy,ex,ey,0x00FF66)
 end
 local function gpuDrawRwrArcs(entry)
     local g=entry.gpu; local cx=entry.cx; local cy=entry.cy; local r=entry.r
@@ -549,7 +547,7 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
 end
 
 -- ==========================================
--- 声纳 GPU 绘制函数（固定扇形，圆点，外圈字母旋转）
+-- 声纳 GPU 绘制（航向基于摄像头）
 -- ==========================================
 local function drawAsdicSector(entry)
     local g = entry.gpu
@@ -601,7 +599,8 @@ local function drawAsdicSector(entry)
         end
     end
 
-    local effectiveHeading = (currentServoAngle + motorOffset) % 360
+    -- 外圈字母：基于有效航向 (currentNorthYawDeg + headingOffset)
+    local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
     local dirs = {
         {angle=0,   label="N"},
         {angle=90,  label="E"},
@@ -706,7 +705,7 @@ local function drawAsdicHUD()
 end
 
 -- ==========================================
--- 终端 UI 三页
+-- 终端 UI 三页（支持参数编辑）
 -- ==========================================
 local function termUI()
     while true do
@@ -724,26 +723,23 @@ local function termUI()
         if currentScreenTab == 1 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== PARAMETERS ===")
-            local y = 5
-            term.setCursorPos(2,y); term.setTextColor(colors.lime)
-            term.write(string.format("Radar Enable : %s", radarEnabled and "yes" or "no"))
-            y = y + 1
-            term.setCursorPos(2,y); term.setTextColor(colors.white)
-            term.write(string.format("Disp Offset  : %d", yawOffset))
-            y = y + 1
-            term.setCursorPos(2,y); term.write(string.format("Motor Offset : %d", motorOffset))
-            y = y + 1
-            term.setCursorPos(2,y); term.write(string.format("Aim Precis   : %d", aimPrecision))
-            y = y + 2
-            term.setCursorPos(2,y); term.setTextColor(colors.yellow)
-            term.write("=== ASDIC PARAMETERS ===")
-            y = y + 1
-            term.setCursorPos(2,y); term.write(string.format("Scan Speed   : %.1f deg/s", ASDIC_SCAN_ANGULAR_SPEED))
-            y = y + 1
-            term.setCursorPos(2,y); term.write(string.format("Broadcast Pos: %s", broadcastOwnPos and "yes" or "no"))
-            y = y + 1
-            term.setCursorPos(2,y); term.setTextColor(colors.gray)
-            term.write("Edit: click line or use keys (config tab only)")
+            local function drawInputBox(y, label, val, isSel, isEdit)
+                term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
+                term.setTextColor(isSel and colors.yellow or colors.lightGray)
+                term.write(label)
+                term.setCursorPos(17,y); term.setBackgroundColor(colors.gray)
+                local txt=(isSel and isEdit) and (inputStr.."_") or tostring(val)
+                term.setTextColor(isSel and colors.white or colors.lightGray)
+                term.write(string.format(" %-12s ", txt))
+                term.setBackgroundColor(colors.black)
+            end
+            drawInputBox(5,  "Radar Enable :", radarEnabled and "yes" or "no", menuIndex==1, isEditing)
+            drawInputBox(7,  "Disp. Offset :", yawOffset,    menuIndex==2, isEditing)
+            drawInputBox(9,  "Motor Offset :", motorOffset,  menuIndex==3, isEditing)
+            drawInputBox(11, "Aim Precis   :", aimPrecision, menuIndex==4, isEditing)
+            drawInputBox(13, "Heading Off  :", headingOffset, menuIndex==5, isEditing)
+            drawInputBox(15, "Scan Speed   :", string.format("%.1f deg/s", ASDIC_SCAN_ANGULAR_SPEED), menuIndex==6, isEditing)
+            drawInputBox(17, "Broadcast Pos:", broadcastOwnPos and "yes" or "no", menuIndex==7, isEditing)
 
         elseif currentScreenTab == 2 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
@@ -778,6 +774,8 @@ local function termUI()
             term.setCursorPos(2,row); term.setTextColor(colors.gray)
             term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg)); row = row+1
             term.setCursorPos(2,row); term.setTextColor(colors.gray)
+            term.write(string.format("Heading Eff: %.1f deg", (currentNorthYawDeg + headingOffset) % 360)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.gray)
             term.write(string.format("Aim grid   : %d deg/step", aimPrecision)); row = row+1
             local beaconCount = 0
             for _, d in pairs(targets) do if d.isBeacon then beaconCount = beaconCount+1 end end
@@ -810,7 +808,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环
+-- 输入事件循环（支持参数编辑）
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -828,8 +826,10 @@ local function inputLoop()
                 if p >= 1 and p <= 90 and (360 % p == 0) then aimPrecision = p end
             end
         elseif menuIndex == 5 then
-            local p = tonumber(inputStr); if p and p > 0 then ASDIC_SCAN_ANGULAR_SPEED = p end
+            local p = tonumber(inputStr); if p then headingOffset = p end
         elseif menuIndex == 6 then
+            local p = tonumber(inputStr); if p and p > 0 then ASDIC_SCAN_ANGULAR_SPEED = p end
+        elseif menuIndex == 7 then
             if inputStr == "yes" then broadcastOwnPos = true
             elseif inputStr == "no" then broadcastOwnPos = false end
         end
@@ -851,20 +851,21 @@ local function inputLoop()
                 end
             elseif currentScreenTab == 1 then
                 if p1 == keys.up then menuIndex = math_max(1, menuIndex - 1)
-                elseif p1 == keys.down then menuIndex = math_min(6, menuIndex + 1)
+                elseif p1 == keys.down then menuIndex = math_min(7, menuIndex + 1)
                 elseif p1 == keys.enter or p1 == keys.numPadEnter then
                     isEditing = true
                     if menuIndex == 1 then inputStr = radarEnabled and "yes" or "no"
                     elseif menuIndex == 2 then inputStr = tostring(yawOffset)
                     elseif menuIndex == 3 then inputStr = tostring(motorOffset)
                     elseif menuIndex == 4 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 5 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 5 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 6 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 7 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 end
             end
         elseif event == "char" and isEditing and currentScreenTab == 1 then
-            if menuIndex == 1 or menuIndex == 6 then
+            if menuIndex == 1 or menuIndex == 7 then
                 if #inputStr < 3 then inputStr = inputStr .. p1 end
             else
                 if (p1 >= '0' and p1 <= '9') or p1 == '.' or (p1 == '-' and #inputStr == 0) then
@@ -881,6 +882,7 @@ local function inputLoop()
                 elseif touchY == 11 then ti = 4
                 elseif touchY == 13 then ti = 5
                 elseif touchY == 15 then ti = 6
+                elseif touchY == 17 then ti = 7
                 end
                 if ti then
                     if isEditing and menuIndex ~= ti then applySave() end
@@ -890,8 +892,9 @@ local function inputLoop()
                     elseif menuIndex == 2 then inputStr = tostring(yawOffset)
                     elseif menuIndex == 3 then inputStr = tostring(motorOffset)
                     elseif menuIndex == 4 then inputStr = tostring(aimPrecision)
-                    elseif menuIndex == 5 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
-                    elseif menuIndex == 6 then inputStr = broadcastOwnPos and "yes" or "no"
+                    elseif menuIndex == 5 then inputStr = tostring(headingOffset)
+                    elseif menuIndex == 6 then inputStr = tostring(ASDIC_SCAN_ANGULAR_SPEED)
+                    elseif menuIndex == 7 then inputStr = broadcastOwnPos and "yes" or "no"
                     end
                 else
                     if isEditing then applySave() end
@@ -977,7 +980,6 @@ end
 local function listenLoop()
     while true do
         local _, _, ch, _, msg = os_pullEvent("modem_message")
-        -- 雷达频道（8888）
         if ch == CHANNEL and type(msg) == "table" and msg.v == 2 and msg.i ~= myId then
             if msg.t == 1 then
                 if not targets[msg.i] then targets[msg.i] = {} end
@@ -986,7 +988,7 @@ local function listenLoop()
                 if msg.x then t.realPos = {x = msg.x, y = msg.y, z = msg.z} end
                 t.range = msg.r; t.lastSeen = os_clock(); t.isBeacon = false
                 if localPos and t.realPos then t.realDist = calcRangingDist(localPos, t.realPos) end
-            elseif msg.t == 2 and msg.ti == myId then -- 雷达被锁定（RWR）
+            elseif msg.t == 2 and msg.ti == myId then
                 local rwrYaw = nil
                 if msg.x and msg.y and msg.z and localPos then
                     local sp = {x = msg.x, y = msg.y, z = msg.z}
@@ -1011,7 +1013,7 @@ local function listenLoop()
                     redstone.setOutput("front",true)
                     os.startTimer(0.5)
                 end
-            elseif msg.t == 3 and msg.ti == myId then -- 声纳频道的RWR也作为雷达RWR处理
+            elseif msg.t == 3 and msg.ti == myId then
                 local rwrYaw = nil
                 if msg.x and msg.y and msg.z and localPos then
                     local sp = {x = msg.x, y = msg.y, z = msg.z}
@@ -1037,7 +1039,6 @@ local function listenLoop()
                     os.startTimer(0.5)
                 end
             end
-        -- 声纳频道（8889）：只接收位置，不触发RWR
         elseif ch == ACTIVE_SONAR_CHANNEL and type(msg) == "table" and msg.v == 2 and msg.t == 1 then
             local id = msg.i
             if not targets[id] then targets[id] = {id = id} end
@@ -1068,14 +1069,12 @@ local function sensorLoop()
     local asdicScanStart = os_clock()
     while true do
         if currentScreenTab == 3 then sleep(0.5) else
-            -- 应力读取
             if cachedStressometer then
                 local ok, cap = pcall(cachedStressometer.getStressCapacity)
                 if ok then currentStressCapacity = cap or 0
                 else cachedStressometer = nil; currentStressCapacity = 0 end
             end
 
-            -- 雷达伺服电机
             if cachedServo then
                 local ok, ang = pcall(cachedServo.getAngle)
                 if ok and type(ang) == "number" then
@@ -1086,7 +1085,6 @@ local function sensorLoop()
                 end
             else isServoConnected = false end
 
-            -- 雷达动态距离
             local depthDynamicMax = MAX_DISTANCE_LIMIT
             if localPos then
                 if localPos.y >= SEA_LEVEL then depthDynamicMax = 1000
@@ -1095,10 +1093,8 @@ local function sensorLoop()
             end
             currentRadarRange = math_min(currentStressCapacity / STRESS_TO_DISTANCE_RATIO, depthDynamicMax)
 
-            -- 声纳激活
             isAsdicActive = (currentStressCapacity >= ASDIC_STRESS_THRESHOLD)
 
-            -- 摄像头获取位置和航向（仅用于雷达N标记和跟踪）
             if camera then
                 local ok, pos = pcall(camera.getCameraPosition)
                 if ok and pos then localPos = pos else localPos = nil end
@@ -1116,14 +1112,13 @@ local function sensorLoop()
             end
 
             local now = os_clock()
-            -- 更新所有目标距离
             for _, t in pairs(targets) do
                 if t.realPos and localPos then
                     t.realDist = calcRangingDist(localPos, t.realPos)
                 end
             end
 
-            -- 构建雷达目标池（圆点，无速度过滤）
+            -- 雷达目标池
             radarPoolCount = 0
             if radarEnabled and currentRadarRange > 0 and isServoConnected and localPos then
                 local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
@@ -1146,7 +1141,6 @@ local function sensorLoop()
                                 t.paintedYaw = tYaw
                                 t.paintedDist = t.realDist
                                 t.lastPaintedRadar = now
-                                -- 雷达锁定告警（发送类型2）
                                 if selectedTargetId == t.id and t.iff == "enemy" then
                                     modem.transmit(CHANNEL, CHANNEL, {v=2, t=2, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
                                 end
@@ -1174,7 +1168,7 @@ local function sensorLoop()
             end
             lastServoAngle = currentServoAngle
 
-            -- 摄像头跟踪（雷达锁定目标）
+            -- 摄像头跟踪（雷达）
             if radarEnabled and selectedTargetId and targets[selectedTargetId] then
                 local t = targets[selectedTargetId]
                 if t.realDist and t.realDist <= currentRadarRange and t.lastSeen and (now - t.lastSeen < 3.0) then
@@ -1210,10 +1204,10 @@ local function sensorLoop()
                 asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
-            -- 构建声纳目标池
+            -- 声纳目标池（使用摄像头航向）
             asdicPoolCount = 0
             if isAsdicActive and localPos then
-                local effectiveHeading = (currentServoAngle + motorOffset) % 360
+                local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                 for id, t in pairs(targets) do
                     if t.realPos and t.realDist and t.realDist >= ASDIC_MIN_DISTANCE and t.realDist <= ASDIC_MAX_DISTANCE
                         and t.realPos.y <= ASDIC_DEPTH_FILTER and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
@@ -1236,7 +1230,6 @@ local function sensorLoop()
                                     t.paintedYaw = tYaw
                                     t.paintedDist = t.realDist
                                     t.lastPaintedAsdic = now
-                                    -- 声纳锁定告警（发送类型3到8889）
                                     modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, {v=2, t=3, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
                                 end
                                 asdicPoolCount = asdicPoolCount + 1
@@ -1262,7 +1255,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v2.0.3 - OK")
+print("Radar+ASDIC v2.1.0 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
@@ -1272,9 +1265,6 @@ print(string.format("  Radar HUD  : %s", radarHud and radarHud.name or "NONE"))
 print(string.format("  ASDIC HUD  : %s", asdicHud and asdicHud.name or "NONE"))
 sleep(1.0)
 
--- ==========================================
--- 并行启动所有协程
--- ==========================================
 parallel.waitForAll(
     function() while true do if radarGpu then gpuRefreshRadar(radarGpu, radarEnabled and (currentRadarRange>0) and isServoConnected, radarPoolCount, radarPool) end sleep(0.05) end end,
     function() while true do if asdicGpu then refreshAsdic(asdicGpu, isAsdicActive, asdicPoolCount, asdicTargetPool) end sleep(0.05) end end,
