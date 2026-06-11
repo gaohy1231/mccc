@@ -38,7 +38,7 @@
 -- ==========================================
 local MAX_DISTANCE_LIMIT       = 3700.0
 local STRESS_TO_DISTANCE_RATIO = 4.0
-local CHANNEL                  = 8889
+local CHANNEL                  = 8888
 local SCAN_SECTOR_WIDTH        = 20
 
 local TARGET_FADE_DURATION = 3.0
