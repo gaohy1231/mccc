@@ -1,9 +1,10 @@
 --[[
 雷达 + 主动声纳 二合一系统   v4.0.1
 修复：
-- 雷达目标现在能正常显示（修复 listenLoop 中 source 未更新的 bug）
-- 雷达有效探测距离公式恢复为：min(应力/换算比, 授权最大距离)
-- 其余功能同 v4.0.0
+- 雷达目标时间戳恢复为 lastPainted，与原始雷达一致，修复无法显示目标的 bug
+- 频道隔离：雷达显示 source==8888 的目标，声纳显示 source==8889 的目标
+- 雷达探测距离公式恢复为：min(应力/换算比, 授权最大距离)
+- 其余功能同 v4.0.0（原版雷达全部特性、主动声纳、四页UI、设备分配等）
 ======================================================================]]
 
 -- ==========================================
@@ -635,7 +636,7 @@ local function drawAsdicSector(entry)
             end
         end
     end
-    local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360  -- 修正为北
+    local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
     local dirs = {
         {angle=0,   label="N"},
         {angle=90,  label="E"},
@@ -1135,7 +1136,7 @@ local function inputLoop()
 end
 
 -- ==========================================
--- 网络循环（修复 source 更新问题）
+-- 网络循环（修复 source 更新）
 -- ==========================================
 local function pingLoop()
     while true do
@@ -1261,7 +1262,7 @@ local function iffToggleLoop()
 end
 
 -- ==========================================
--- 主传感器循环（雷达距离公式恢复）
+-- 主传感器循环（雷达距离公式恢复，修复 lastPainted 字段）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1311,7 +1312,7 @@ local function sensorLoop()
                 if t.realPos and localPos then t.realDist = calcRangingDist(localPos, t.realPos) end
             end
 
-            -- 雷达目标池（只包含 source==8888 的目标）
+            -- 雷达目标池（修复 lastPainted 字段名）
             radarPoolCount = 0
             if radarEnabled and currentRadarRange > 0 and isServoConnected and localPos then
                 local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
@@ -1330,10 +1331,10 @@ local function sensorLoop()
                             _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, t.realPos.x,t.realPos.y,t.realPos.z)
                         end
                         if math_abs(getAngleDiff(tYaw, currentServoAngle)) <= effectiveSW/2 then
-                            if not t.lastPaintedRadar or (now - t.lastPaintedRadar >= 0.5) then
+                            if not t.lastPainted or (now - t.lastPainted >= 0.5) then
                                 t.paintedYaw = tYaw
                                 t.paintedDist = t.realDist
-                                t.lastPaintedRadar = now
+                                t.lastPainted = now
                                 if selectedTargetId == t.id and t.iff == "enemy" then
                                     modem.transmit(CHANNEL, CHANNEL, {v=2, t=2, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
                                 end
@@ -1342,7 +1343,7 @@ local function sensorLoop()
                             if t.iff == "friendly" then hotColor = C.ALLY_HOT
                             elseif t.iff == "enemy" then hotColor = C.FOE_HOT
                             else hotColor = C.UNK_HOT end
-                            local age = now - t.lastPaintedRadar
+                            local age = now - t.lastPainted
                             local col = calcFadeColor(age, hotColor)
                             if col and col ~= C.BLACK then
                                 local yawRad = math_rad(tYaw + yawOffset)
@@ -1359,7 +1360,7 @@ local function sensorLoop()
                 end
                 -- 信标
                 for _, t in pairs(targets) do
-                    if t.isBeacon and t.source == 8888 and t.lastSeen and (now - t.lastSeen < 5.0) and t.realPos then
+                    if t.source == 8888 and t.isBeacon and t.lastSeen and (now - t.lastSeen < 5.0) and t.realPos then
                         local col = (t.iff == "friendly") and C.BEACON_ALLY or C.BEACON_UNK
                         local tYaw = 0
                         if currentQAbs and currentQLoc then
@@ -1423,7 +1424,7 @@ local function sensorLoop()
                 asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
             end
 
-            -- 声纳目标池（只包含 source==8889 的目标）
+            -- 声纳目标池
             asdicPoolCount = 0
             if isAsdicActive and localPos then
                 local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
