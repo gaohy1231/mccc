@@ -1,10 +1,12 @@
 --[[
-GHG Hydrophone (被动声纳) v2.5.0
-修正：
-- 相对本船方位角 = 目标绝对方位 - 船首航向 (0°正前, 0~359°)
-- 世界方位角 = 目标绝对方位 (0°北顺时针)
-- TMA AOB = atan2(本艇X - 目标X, 本艇Z - 目标Z) - 目标航向，归一化到 -180..180 (左舷负/右舷正)
-- 保留多频道通信、两点TMA、TPS补偿测速、RWR、深度动态等全部功能
+GHG Hydrophone (被动声纳) v2.5.2
+修复：
+- 恢复水听 GPU 方向字母 (N/E/S/W) 及 45° 刻度
+- 增加航向手动校准参数 Heading Offset
+- 修正 TMA AOB 计算公式（正值右舷、负值左舷）
+- 移除残留的 IFF 相关代码
+- 终端 UI 恢复三页布局：参数、状态、设备
+- 其余功能保留：多频道、两点 TMA、TPS 补偿测速、RWR 等
 ======================================================================]]
 
 -- ==========================================
@@ -12,8 +14,8 @@ GHG Hydrophone (被动声纳) v2.5.0
 -- ==========================================
 local MAX_DISTANCE_LIMIT       = 5000.0
 local STRESS_TO_DISTANCE_RATIO = 2.0
-local CHANNEL                  = 8888              -- 原有频道 (水听/雷达网络)
-local ACTIVE_SONAR_CHANNEL     = 8889              -- 主动声纳频道
+local CHANNEL                  = 8888
+local ACTIVE_SONAR_CHANNEL     = 8889
 local SCAN_SECTOR_WIDTH        = 20
 local SEA_LEVEL                = -4
 
@@ -21,13 +23,13 @@ local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local RWR_ARC_DURATION     = 1.0
 local SPEED_FILTER_MIN     = 4.0    -- km/h
-local SPEED_INTERVAL       = 3.0    -- 测速定时器间隔 (秒)
+local SPEED_INTERVAL       = 3.0
 
 local REG_QUERY_TIMEOUT = 5.0
 
 -- 简单 TMA 配置
-local TMA_FIRST_WAIT  = 50.0  -- 第一次记录等待时间 (秒)
-local TMA_SECOND_WAIT = 10.0  -- 第二次记录等待时间 (秒)
+local TMA_FIRST_WAIT  = 50.0
+local TMA_SECOND_WAIT = 10.0
 
 -- ==========================================
 -- 外设初始化
@@ -121,13 +123,14 @@ local currentServoAngle        = 0
 local isServoConnected         = false
 local yawOffset    = 0
 local motorOffset  = 0
+local headingOffset = 0            -- 新增：航向手动校准
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
-local currentNorthYawDeg    = 0      -- 船首真实航向 (0°北顺时针)
-local currentScreenTab      = 1
+local currentNorthYawDeg    = 0       -- 将包含 headingOffset 的校正航向
+local currentScreenTab      = 1       -- 1=参数, 2=状态, 3=设备
 local menuIndex             = 1
 local isEditing             = false
 local inputStr              = ""
@@ -156,8 +159,9 @@ local function loadConfig()
         local data = textutils.unserialize(f.readAll())
         f.close()
         if type(data) == "table" then
-            if data.yawOffset    then yawOffset    = tonumber(data.yawOffset)   or 0 end
-            if data.motorOffset  then motorOffset  = tonumber(data.motorOffset) or 0 end
+            if data.yawOffset     then yawOffset    = tonumber(data.yawOffset)   or 0 end
+            if data.motorOffset   then motorOffset  = tonumber(data.motorOffset) or 0 end
+            if data.headingOffset then headingOffset = tonumber(data.headingOffset) or 0 end
             if data.aimPrecision then
                 local p = tonumber(data.aimPrecision)
                 if p and p >= 1 and p <= 90 and (360 % math_floor(p) == 0) then
@@ -174,10 +178,11 @@ end
 local function saveConfig()
     local f = fs.open(CONFIG_FILE, "w")
     f.write(textutils.serialize({
-        yawOffset    = yawOffset,
-        motorOffset  = motorOffset,
-        aimPrecision = aimPrecision,
-        monitorModes = monitorModes,
+        yawOffset     = yawOffset,
+        motorOffset   = motorOffset,
+        headingOffset = headingOffset,
+        aimPrecision  = aimPrecision,
+        monitorModes  = monitorModes,
     }))
     f.close()
 end
@@ -312,7 +317,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Hydrophone v2.5.0 - Registration Check")
+    print("Hydrophone v2.5.2 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -466,7 +471,7 @@ local function simpleTMA(pos1, pos2, ownPos2, ownCourse)
     local dx = pos2.x - pos1.x
     local dz = pos2.z - pos1.z
     local dist = math_sqrt(dx*dx + dz*dz)
-    -- 目标航向 (从pos1到pos2的方向，0°北顺时针)
+    -- 目标航向 (从pos1到pos2的方向，0°北顺时针) 注意Minecraft Z轴为南，需要转换
     local heading = math_deg(math_atan2(dx, dz)) % 360
     local speed_ms = dist / TMA_SECOND_WAIT
     local speed_kph = speed_ms * 3.6
@@ -476,9 +481,9 @@ local function simpleTMA(pos1, pos2, ownPos2, ownCourse)
     local dz2 = pos2.z - ownPos2.z
     local range = math_sqrt(dx2*dx2 + dz2*dz2)
 
-    -- AOB = 从目标看本艇的视线方位 - 目标航向
+    -- AOB = heading - LOS_target (正右舷负左舷)
     local los_target = math_deg(math_atan2(ownPos2.x - pos2.x, ownPos2.z - pos2.z)) % 360
-    local aob = (los_target - heading + 180) % 360 - 180  -- 归一化到 -180..180
+    local aob = (heading - los_target + 180) % 360 - 180
 
     return {
         heading = heading,
@@ -618,7 +623,7 @@ local function tmaHUDLoop()
 end
 
 -- ==========================================
--- GPU 绘制 (修正相对方位)
+-- GPU 绘制 (水听风格：N/E/S/W + 45°刻度)
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -647,12 +652,37 @@ local function gpuDrawRadarBase(entry)
             if (px2-cx)^2+(py-cy)^2<=r*r then g.line(px2,py,px2,py,C.GRID) end
         end
     end
-    local northRad=math_rad(currentNorthYawDeg+yawOffset)
-    local circPx=cx+math_floor(r*math_sin(northRad)+0.5)
-    local circPy=cy-math_floor(r*math_cos(northRad)+0.5)
-    local tX=math_max(1,math_min(entry.w-6,circPx-3))
-    local tY=math_max(1,math_min(entry.h-8,circPy-4))
-    pcall(g.drawText,tX,tY,"N",C.YELLOW,C.BG,1)
+
+    -- 方向字母和刻度
+    local dirs = {
+        {angle=0,   label="N", isTick=false},
+        {angle=45,  label="",  isTick=true},
+        {angle=90,  label="E", isTick=false},
+        {angle=135, label="",  isTick=true},
+        {angle=180, label="S", isTick=false},
+        {angle=225, label="",  isTick=true},
+        {angle=270, label="W", isTick=false},
+        {angle=315, label="",  isTick=true},
+    }
+    local northRad = math_rad(currentNorthYawDeg + yawOffset)
+    for _, d in ipairs(dirs) do
+        local dirRad = northRad + math_rad(d.angle)
+        if d.isTick then
+            -- 刻度线：从 r-4 到 r
+            local startX = cx + math_floor((r-4) * math_sin(dirRad) + 0.5)
+            local startY = cy - math_floor((r-4) * math_cos(dirRad) + 0.5)
+            local endX = cx + math_floor(r * math_sin(dirRad) + 0.5)
+            local endY = cy - math_floor(r * math_cos(dirRad) + 0.5)
+            g.line(startX, startY, endX, endY, C.OUTER_RING)
+        else
+            -- 字母绘制在 r-6 处
+            local txX = cx + math_floor((r-6) * math_sin(dirRad) - 3)
+            local txY = cy - math_floor((r-6) * math_cos(dirRad) + 4)
+            txX = math_max(1, math_min(entry.w-6, txX))
+            txY = math_max(1, math_min(entry.h-8, txY))
+            pcall(g.drawText, txX, txY, d.label, C.WHITE, C.BG, 1)
+        end
+    end
 end
 local function gpuDrawSweep(entry,angleDeg)
     local g=entry.gpu; local cx=entry.cx; local cy=entry.cy; local r=entry.r
@@ -709,7 +739,7 @@ local function gpuRefreshRadar(entry, isActive, poolCount, pool)
                 local endX = cx + math_floor(lineLength * t.s + 0.5)
                 local endY = cy - math_floor(lineLength * t.cs + 0.5)
                 g.line(cx, cy, endX, endY, t.col)
-                -- 相对本船方位角 = 目标绝对方位 - 船首航向
+                -- 相对本船方位角 = 目标绝对方位 - 校正后船首航向
                 if t.relAngle then
                     local angleStr = tostring(t.relAngle) .. "°"
                     local textX = endX + math_floor(5 * t.s + 0.5)
@@ -732,7 +762,7 @@ local function rdrGpuUI()
     if #rdrGpuList==0 then return end
     local frames=0; local lastActive=false
     while true do
-        if currentScreenTab==2 then
+        if currentScreenTab==3 then
             for _,entry in ipairs(rdrGpuList) do
                 pcall(function()
                     entry.gpu.fill(C.BG)
@@ -763,7 +793,7 @@ local function rdrGpuUI()
                                 t.col = col
                                 t.s = math_sin(yawRad)
                                 t.cs = math_cos(yawRad)
-                                -- 相对本船方位角 = 目标绝对方位 - 船首航向 (0~359)
+                                -- 相对本船方位角 = 目标绝对方位 - 校正后船首航向 (0~359)
                                 local relAngle = math_floor((data.paintedYaw - currentNorthYawDeg) % 360 + 0.5) % 360
                                 t.relAngle = relAngle
                             end
@@ -807,9 +837,7 @@ local function hudMonitorUI()
                     rColor = colors.lime
                     if selectedTargetId and targets[selectedTargetId] then
                         local sel = targets[selectedTargetId]
-                        -- 相对本船方位角 = 目标绝对方位 - 船首航向
                         local relBoat = math_floor((sel.paintedYaw or 0) - currentNorthYawDeg + 0.5) % 360
-                        -- 世界方位角 = 目标绝对方位
                         local absWorld = math_floor((sel.paintedYaw or 0) % 360 + 0.5) % 360
                         lText = string.format("%.0f / %.0f", relBoat, absWorld)
                         lColor = colors.white
@@ -861,60 +889,26 @@ local function hudMonitorUI()
 end
 
 -- ==========================================
--- 终端 UI
+-- 终端 UI (三页：参数、状态、设备)
 -- ==========================================
 local function termUI()
     while true do
         term.setBackgroundColor(colors.black)
         term.clear()
-        if currentScreenTab==2 then
-            term.setCursorPos(2,2); term.setTextColor(colors.lightGray)
-            term.write("=== CONNECTED DISPLAYS ===")
-            local r=4
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[TOM'S GPU - RDR]"); r=r+1
-            if #rdrGpuList==0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No tm_gpu found."); r=r+1
-            else
-                for _,entry in ipairs(rdrGpuList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..entry.name)
-                    term.setCursorPos(22,r); term.setTextColor(colors.white)
-                    term.write(string.format("[%dx%d]",entry.bw,entry.bh))
-                    term.setCursorPos(30,r); term.setTextColor(colors.green)
-                    term.write("[dot:"..entry.dotSize.."]"); r=r+1
-                end
-            end
-            r=r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.cyan)
-            term.write("[CC MONITOR - HUD]"); r=r+1
-            if #hudMonitorList==0 then
-                term.setCursorPos(4,r); term.setTextColor(colors.red)
-                term.write("No monitors found."); r=r+1
-            else
-                for _,info in ipairs(hudMonitorList) do
-                    term.setCursorPos(4,r); term.setTextColor(colors.lightBlue)
-                    term.write("- "..info.displayName)
-                    term.setCursorPos(24,r); term.setTextColor(colors.yellow)
-                    term.write("[HUD]"); info.termRow=r; r=r+1
-                end
-            end
-            r=r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.lightGray)
-            term.write("Camera: ")
-            local shortN=cameraName
-            if #shortN>12 then shortN=shortN:sub(1,12) end
-            term.setTextColor(colors.white); term.write(shortN)
-            term.setTextColor(colors.cyan);  term.write("  [ONLINE]")
-            r=r+2
-            term.setCursorPos(2,r); term.setTextColor(colors.yellow)
-            term.write("Press [TAB] to Resume"); r=r+1
-            term.setCursorPos(2,r); term.setTextColor(colors.red)
-            term.write("[SYSTEM PAUSED FOR CONFIG]")
-        else
-            term.setCursorPos(2,2); term.setTextColor(colors.yellow)
-            term.write("=== HYDROPHONE CONFIG ===")
+        local w, h = term.getSize()
+
+        local tabs = {"PARAMS", "STATUS", "DEVICES"}
+        local tabStr = ""
+        for i, t in ipairs(tabs) do
+            tabStr = tabStr .. (i == currentScreenTab and ("["..t.."]") or " "..t.." ") .. "  "
+        end
+        term.setCursorPos(2, 1); term.setTextColor(colors.white)
+        term.write("TAB " .. tabStr)
+
+        if currentScreenTab == 1 then
+            -- 参数页
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
+            term.write("=== PARAMETERS ===")
 
             local function drawInputBox(y, label, val, isSel, isEdit)
                 term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
@@ -927,79 +921,98 @@ local function termUI()
                 term.setBackgroundColor(colors.black)
             end
 
-            drawInputBox(4,  "Disp. Offset:", yawOffset,    menuIndex==1, isEditing)
-            drawInputBox(6,  "Motor Offset:", motorOffset,  menuIndex==2, isEditing)
-            drawInputBox(8,  "Aim Precis  :", aimPrecision, menuIndex==3, isEditing)
+            drawInputBox(5,  "Disp. Offset:", yawOffset,    menuIndex==1, isEditing)
+            drawInputBox(7,  "Motor Offset:", motorOffset,  menuIndex==2, isEditing)
+            drawInputBox(9,  "Aim Precis  :", aimPrecision, menuIndex==3, isEditing)
+            drawInputBox(11, "Heading Off :", headingOffset, menuIndex==4, isEditing)
 
-            term.setCursorPos(2,10); term.setTextColor(colors.yellow)
+        elseif currentScreenTab == 2 then
+            -- 状态页
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== SYSTEM STATUS ===")
-
-            term.setCursorPos(2,12); term.setTextColor(colors.lime)
-            term.write(string.format("Registered : %s", myLabel))
-
-            term.setCursorPos(2,13); term.setTextColor(colors.cyan)
-            term.write(string.format("Max Range  : %.0f m", MAX_DISTANCE_LIMIT))
-
-            term.setCursorPos(2,14); term.setTextColor(colors.lightGray)
-            term.write(string.format("SU Ratio   : %g SU/m", STRESS_TO_DISTANCE_RATIO))
-
-            term.setCursorPos(2,15); term.setTextColor(colors.green)
-            term.write("Camera     : ONLINE")
-
-            term.setCursorPos(2,16)
+            local row = 5
+            term.setCursorPos(2,row); term.setTextColor(colors.lime)
+            term.write("Registered : " .. myLabel); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write(string.format("Max Range  : %.0f m", MAX_DISTANCE_LIMIT)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.lightGray)
+            term.write(string.format("SU Ratio   : %g SU/m", STRESS_TO_DISTANCE_RATIO)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.green)
+            term.write("Camera     : ONLINE"); row = row+1
+            row = row+1
             if isServoConnected then
-                term.setTextColor(colors.white)
-                term.write(string.format("Motor Angle: %6.1f deg", currentServoAngle))
+                term.setCursorPos(2,row); term.setTextColor(colors.white)
+                term.write(string.format("Motor Angle: %6.1f deg", currentServoAngle)); row = row+1
             else
-                term.setTextColor(colors.red); term.write("Motor Angle: OFFLINE")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Motor Angle: OFFLINE"); row = row+1
             end
-
-            term.setCursorPos(2,17)
             if currentRadarRange==0 then
-                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Power!)")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Op. Range  : 0.0 (No Power!)"); row = row+1
             elseif not isServoConnected then
-                term.setTextColor(colors.red); term.write("Op. Range  : 0.0 (No Motor!)")
+                term.setCursorPos(2,row); term.setTextColor(colors.red)
+                term.write("Op. Range  : 0.0 (No Motor!)"); row = row+1
             else
-                term.setTextColor(colors.green)
-                term.write(string.format("Op. Range  : %.1f m", currentRadarRange))
+                term.setCursorPos(2,row); term.setTextColor(colors.green)
+                term.write(string.format("Op. Range  : %.1f m", currentRadarRange)); row = row+1
             end
-
-            term.setCursorPos(2,18)
-            if iffMode=="friendly" then
-                term.setTextColor(colors.lightBlue); term.write("IFF Mode   : ")
-                term.setBackgroundColor(colors.blue); term.setTextColor(colors.white)
-                term.write(" ALLY "); term.setBackgroundColor(colors.black)
-            else
-                term.setTextColor(colors.red); term.write("IFF Mode   : ")
-                term.setBackgroundColor(colors.red); term.setTextColor(colors.white)
-                term.write(" FOE  "); term.setBackgroundColor(colors.black)
-            end
-
-            term.setCursorPos(2,19); term.setTextColor(colors.gray)
-            term.write("[TAB] Monitor  [Back RS] IFF")
-
-            term.setCursorPos(2,20); term.setTextColor(colors.cyan)
-            term.write((#rdrGpuList>0)
-                and ("RDR GPU: "..(#rdrGpuList).." online")
-                or  "RDR GPU: NONE")
-
-            term.setCursorPos(2,21); term.setTextColor(colors.gray)
-            term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg))
-
-            term.setCursorPos(2,22); term.setTextColor(colors.gray)
-            term.write(string.format("Aim grid   : %d deg/step", aimPrecision))
-
+            term.setCursorPos(2,row); term.setTextColor(colors.gray)
+            term.write(string.format("North Yaw  : %.1f deg", currentNorthYawDeg)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.gray)
+            term.write(string.format("Aim grid   : %d deg/step", aimPrecision)); row = row+1
             local beaconCount=0
             for _,d in pairs(targets) do if d.isBeacon then beaconCount=beaconCount+1 end end
-            term.setCursorPos(2,23); term.setTextColor(colors.yellow)
-            term.write(string.format("Beacons    : %d online", beaconCount))
+            term.setCursorPos(2,row); term.setTextColor(colors.yellow)
+            term.write(string.format("Beacons    : %d online", beaconCount)); row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.white)
+            term.write(string.format("TPS (est.) : %.1f", tpsEstimate))
+
+        else
+            -- 设备页
+            term.setCursorPos(2,3); term.setTextColor(colors.yellow)
+            term.write("=== DISPLAYS ===")
+            local row = 5
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("[TOM'S GPU - RDR]"); row = row+1
+            if #rdrGpuList==0 then
+                term.setCursorPos(4,row); term.setTextColor(colors.red)
+                term.write("No tm_gpu found."); row = row+1
+            else
+                for _,entry in ipairs(rdrGpuList) do
+                    term.setCursorPos(4,row); term.setTextColor(colors.lightBlue)
+                    term.write("- "..entry.name)
+                    term.setCursorPos(22,row); term.setTextColor(colors.white)
+                    term.write(string.format("[%dx%d]",entry.bw,entry.bh))
+                    term.setCursorPos(30,row); term.setTextColor(colors.green)
+                    term.write("[dot:"..entry.dotSize.."]"); row = row+1
+                end
+            end
+            row = row+1
+            term.setCursorPos(2,row); term.setTextColor(colors.cyan)
+            term.write("[CC MONITOR - HUD]"); row = row+1
+            if #hudMonitorList==0 then
+                term.setCursorPos(4,row); term.setTextColor(colors.red)
+                term.write("No monitors found."); row = row+1
+            else
+                for _,info in ipairs(hudMonitorList) do
+                    term.setCursorPos(4,row); term.setTextColor(colors.lightBlue)
+                    term.write("- "..info.displayName)
+                    term.setCursorPos(24,row); term.setTextColor(colors.yellow)
+                    term.write("[HUD]"); info.termRow=row; row = row+1
+                end
+            end
+            if tmaMonitor then
+                term.setCursorPos(4,row); term.setTextColor(colors.lightBlue)
+                term.write("- TMA Monitor attached")
+            end
         end
         sleep(0.2)
     end
 end
 
 -- ==========================================
--- 输入事件循环
+-- 输入事件循环 (增加 Heading Offset 编辑)
 -- ==========================================
 local function inputLoop()
     local function applySave()
@@ -1013,6 +1026,8 @@ local function inputLoop()
                 p=math_floor(math_abs(p))
                 if p>=1 and p<=90 and (360%p==0) then aimPrecision=p end
             end
+        elseif menuIndex==4 then
+            local p=tonumber(inputStr); if p then headingOffset=p end
         end
         saveConfig(); isEditing=false
     end
@@ -1022,7 +1037,7 @@ local function inputLoop()
 
         if event=="key" then
             if p1==keys.tab then
-                currentScreenTab=(currentScreenTab==1) and 2 or 1
+                currentScreenTab = (currentScreenTab % 3) + 1
             elseif isEditing and currentScreenTab==1 then
                 if p1==keys.enter or p1==keys.numPadEnter then
                     applySave()
@@ -1031,16 +1046,18 @@ local function inputLoop()
                 end
             elseif currentScreenTab==1 then
                 if     p1==keys.up   then menuIndex=math_max(1,menuIndex-1)
-                elseif p1==keys.down then menuIndex=math_min(3,menuIndex+1)
+                elseif p1==keys.down then menuIndex=math_min(4,menuIndex+1)
                 elseif p1==keys.enter or p1==keys.numPadEnter then
                     isEditing=true
                     if     menuIndex==1 then inputStr=tostring(yawOffset)
                     elseif menuIndex==2 then inputStr=tostring(motorOffset)
-                    elseif menuIndex==3 then inputStr=tostring(aimPrecision) end
+                    elseif menuIndex==3 then inputStr=tostring(aimPrecision)
+                    elseif menuIndex==4 then inputStr=tostring(headingOffset)
+                    end
                 end
             end
         elseif event=="char" and isEditing and currentScreenTab==1 then
-            if menuIndex==1 or menuIndex==2 then
+            if menuIndex==1 or menuIndex==2 or menuIndex==4 then
                 if (p1>='0' and p1<='9') or p1=='.'
                     or (p1=='-' and #inputStr==0)
                 then
@@ -1055,21 +1072,24 @@ local function inputLoop()
             local touchY=p3
             if currentScreenTab==1 then
                 local ti=nil
-                if     touchY==4 then ti=1
-                elseif touchY==6 then ti=2
-                elseif touchY==8 then ti=3 end
+                if     touchY==5 then ti=1
+                elseif touchY==7 then ti=2
+                elseif touchY==9 then ti=3
+                elseif touchY==11 then ti=4 end
                 if ti then
                     if isEditing and menuIndex~=ti then applySave() end
                     menuIndex=ti; isEditing=true
                     if     menuIndex==1 then inputStr=tostring(yawOffset)
                     elseif menuIndex==2 then inputStr=tostring(motorOffset)
-                    elseif menuIndex==3 then inputStr=tostring(aimPrecision) end
+                    elseif menuIndex==3 then inputStr=tostring(aimPrecision)
+                    elseif menuIndex==4 then inputStr=tostring(headingOffset)
+                    end
                 else
                     if isEditing then applySave() end
                 end
             end
         elseif (event=="tm_monitor_touch" or event=="tm_monitor_mouse_click")
-            and currentScreenTab==1
+            and currentScreenTab~=3
         then
             local touchedName=p1; local mx,my=p2,p3
             local entry=gpuNameMap[touchedName]
@@ -1119,7 +1139,7 @@ end
 -- ==========================================
 local function pingLoop()
     while true do
-        if currentScreenTab==2 then sleep(0.5)
+        if currentScreenTab==3 then sleep(0.5)
         else
             if localPos then
                 local baseMsg = {
@@ -1166,7 +1186,6 @@ local function listenLoop()
         if type(msg)~="table" or msg.v~=2 then goto nextMsg end
 
         if ch == CHANNEL then
-            -- 原有频道处理
             if msg.t==1 and msg.i~=myId then
                 if not targets[msg.i] then targets[msg.i] = {id=msg.i} end
                 local t = targets[msg.i]
@@ -1176,7 +1195,6 @@ local function listenLoop()
                 local cd = calcRangingDist(localPos, t.realPos)
                 t.realDist = cd or dist
             elseif msg.t==3 and msg.ti == myId then
-                -- RWR 处理
                 local rwrYaw = nil
                 if msg.x and msg.y and msg.z and localPos then
                     local sp = {x=msg.x, y=msg.y, z=msg.z}
@@ -1205,7 +1223,6 @@ local function listenLoop()
                 os_queueEvent("rwr_detected")
             end
         elseif ch == ACTIVE_SONAR_CHANNEL then
-            -- 主动声纳频道：仅处理被锁定告警（类型3）
             if msg.t==3 and msg.ti == myId then
                 local rwrYaw = nil
                 if msg.x and msg.y and msg.z and localPos then
@@ -1308,12 +1325,12 @@ local function speedTimerLoop()
 end
 
 -- ==========================================
--- 扫描解算
+-- 扫描解算 (航向校正)
 -- ==========================================
 local function cameraLoop()
     local lastServoAngle=nil; local peripheralPollTick=0
     while true do
-        if currentScreenTab==2 then sleep(0.5)
+        if currentScreenTab==3 then sleep(0.5)
         else
             if peripheralPollTick<=0 then
                 peripheralPollTick=20
@@ -1372,8 +1389,8 @@ local function cameraLoop()
                         local hx,hy,hz=rotateVectorFast(0,0,-1,iqx,iqy,iqz,iqw)
                         local sx,sy,sz=rotateVectorFast(hx,hy,hz,
                             currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                        -- 修正航向：+180°使得0°为北
-                        currentNorthYawDeg = (math_deg(math_atan2(-sx,sz)) + 180) % 360
+                        -- 原始摄像头航向 + 手动偏移
+                        currentNorthYawDeg = (math_deg(math_atan2(-sx,sz)) + 180 + headingOffset) % 360
                     end
                     local bestTarget=nil
                     local now=os_clock(); local refPos=localPos
@@ -1507,7 +1524,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("GHG Hydrophone v2.5.0 - OK")
+print("GHG Hydrophone v2.5.2 - OK")
 print(string.format("  Name      : %s  [fixed]", myLabel))
 print(string.format("  Max Range : %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  RDR GPU   : %d", #rdrGpuList))
