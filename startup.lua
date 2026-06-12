@@ -1,10 +1,13 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.0.2
+雷达 + 主动声纳 二合一系统   v4.1.0
 修复：
-- 雷达目标池构建逻辑与原始雷达完全一致：仅依赖 lastPainted 时间，使用 paintedDist/paintedYaw
-- 频道隔离：雷达显示 source==8888 的目标，声纳显示 source==8889 的目标
-- 雷达探测距离公式恢复为：min(应力/换算比, 授权最大距离)
-- 其余功能同 v4.0.1（原版雷达全部特性、主动声纳、四页UI、设备分配等）
+- 雷达 GPU 主循环恢复原始 rdrGpuUI 逻辑（帧计数、IFF检测、池内构建）
+- 声纳 GPU 主循环独立（无IFF、无RWR，池内构建）
+- 修复雷达字体异常（恢复原始 scale 参数）
+- 目标点颜色与锁定行为与原始雷达一致（热力色淡出，锁定变红）
+- 雷达仅显示 8888 目标，声纳仅显示 8889 目标
+- 雷达距离 = min(应力/换算比, 授权最大值)
+- 速度过滤仅水听使用，雷达/声纳不使用
 ======================================================================]]
 
 -- ==========================================
@@ -20,7 +23,6 @@ local SEA_LEVEL                = -4
 local TARGET_FADE_DURATION = 3.0
 local TARGET_HOT_DURATION  = 1.0
 local RWR_ARC_DURATION     = 1.0
-local SPEED_FILTER_MIN     = 4.0   -- 保留，当前未使用
 
 -- 主动声纳参数
 local ASDIC_MIN_DISTANCE    = 100.0
@@ -124,7 +126,7 @@ local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
-local currentNorthYawDeg    = 0      -- 摄像头原始航向（原雷达风格）
+local currentNorthYawDeg    = 0      -- 摄像头原始航向
 local currentScreenTab      = 1      -- 1=雷达参数, 2=声纳参数, 3=状态, 4=设备
 local menuIndex             = 1
 local isEditing             = false
@@ -135,15 +137,9 @@ local cachedServo           = peripheral.find("servo")
 local radarEnabled = true
 local broadcastOwnPos = false
 
--- 雷达目标池
-local radarPool      = {}
-local radarPoolCount = 0
-
 -- 声纳状态
 local isAsdicActive  = false
 local asdicScanAngle  = 0
-local asdicTargetPool = {}
-local asdicPoolCount  = 0
 
 -- IFF 和 RWR
 local iffMode   = "enemy"
@@ -170,6 +166,7 @@ local ROLE_LABELS = {
     asdicHud = "ASDIC HUD"
 }
 
+-- 收集外设
 for _, name in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(name)
     if ptype == "tm_gpu" then table.insert(allGpus, name)
@@ -215,6 +212,7 @@ local function applyDeviceMap()
         if role == "radarHud" then radarHud = peripheral.wrap(name); radarHud.setTextScale(1)
         elseif role == "asdicHud" then asdicHud = peripheral.wrap(name); asdicHud.setTextScale(1) end
     end
+    -- 自动分配未指定的
     if not radarGpu and #allGpus >= 1 and not deviceMap[allGpus[1]] then
         deviceMap[allGpus[1]] = "radarGpu"; radarGpu = peripheral.wrap(allGpus[1])
     end
@@ -234,7 +232,7 @@ applyDeviceMap()
 local isHeadless = (radarGpu == nil and asdicGpu == nil and radarHud == nil and asdicHud == nil)
 
 -- ==========================================
--- 算法函数（雷达原版）
+-- 算法函数
 -- ==========================================
 local function calculateLookAngles(sx, sy, sz, tx, ty, tz)
     local dx, dy, dz = tx - sx, ty - sy, tz - sz
@@ -315,7 +313,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.0.2 - Registration Check")
+    print("Radar+ASDIC v4.1.0 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -473,7 +471,7 @@ local C = {
 }
 
 -- ==========================================
--- 雷达 GPU 绘制函数（完整原版）
+-- 雷达 GPU 绘制函数（完整原版，恢复原始 scale）
 -- ==========================================
 local function gpuDrawCircle(g, cx, cy, r, color)
     local x, y, d = r, 0, 1 - r
@@ -670,6 +668,171 @@ local function refreshAsdic(entry, isActive, poolCount, pool)
     local ey = cy - math_floor(r * math_cos(rad))
     g.line(cx, cy, ex, ey, 0x00FF66)
     g.sync()
+end
+
+-- ==========================================
+-- 雷达 GPU 主循环（完全恢复原始逻辑）
+-- ==========================================
+local function rdrGpuUI()
+    if not radarGpu then return end
+    local w, h = radarGpu.getSize()
+    local cx = math_floor(w/2)
+    local cy = math_floor(h/2)
+    local r = math_floor(math_min(cx, cy)*0.88)
+    local ds = 4
+    if r < 80 then ds = 3 end
+    if r < 50 then ds = 2 end
+    local entry = {gpu = radarGpu, cx = cx, cy = cy, r = r, w = w, h = h, dotSize = ds, lastSweepDeg = -9999}
+    local frames = 0
+    local lastActive = false
+    local lastIff = nil
+    local targetPool = {}
+    local poolCount = 0
+
+    while true do
+        if currentScreenTab == 4 then
+            if radarGpu then
+                radarGpu.fill(C.BG)
+                pcall(radarGpu.drawText, cx - 6, cy - 4, peripheral.getName(radarGpu), C.WHITE, C.BG, 2)
+                radarGpu.sync()
+            end
+            sleep(0.3)
+        else
+            frames = frames + 1
+            local isActive = radarEnabled and (currentRadarRange > 0) and isServoConnected
+            local forceRedraw = (isActive ~= lastActive) or (iffMode ~= lastIff)
+            lastActive = isActive
+            lastIff = iffMode
+            poolCount = 0
+            local now = os_clock()
+
+            if localPos and isActive then
+                -- 普通目标（非信标）
+                for _, data in pairs(targets) do
+                    if data.source == 8888 and data.lastPainted and not data.isBeacon then
+                        local age = now - data.lastPainted
+                        if age < TARGET_FADE_DURATION then
+                            local hotColor
+                            if data.iff == "friendly" then hotColor = C.ALLY_HOT
+                            elseif data.iff == "enemy" then hotColor = C.FOE_HOT
+                            else hotColor = C.UNK_HOT end
+                            local col = calcFadeColor(age, hotColor)
+                            if col and col ~= C.BLACK then
+                                local yawRad = math_rad(data.paintedYaw + yawOffset)
+                                local distRatio = math_min(data.paintedDist / currentRadarRange, 1.0)
+                                poolCount = poolCount + 1
+                                local t = targetPool[poolCount]
+                                if not t then t = {}; targetPool[poolCount] = t end
+                                t.col = col; t.r = distRatio
+                                t.s = math_sin(yawRad); t.cs = math_cos(yawRad)
+                                t.isBeacon = false
+                            end
+                        end
+                    end
+                end
+                -- 信标
+                for _, data in pairs(targets) do
+                    if data.source == 8888 and data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
+                        local col = (data.iff == "friendly") and C.BEACON_ALLY or C.BEACON_UNK
+                        local tYaw = 0
+                        if currentQAbs and currentQLoc then
+                            local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
+                            local dx = data.realPos.x - localPos.x
+                            local dy = data.realPos.y - localPos.y
+                            local dz = data.realPos.z - localPos.z
+                            local hx,hy,hz = rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                            local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
+                            tYaw = math_deg(math_atan2(-sx,sz))
+                        else
+                            _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, data.realPos.x,data.realPos.y,data.realPos.z)
+                        end
+                        local dist = calcRangingDist(localPos, data.realPos) or 0
+                        local distRatio = (currentRadarRange > 0) and math_min(dist/currentRadarRange, 1.0) or 1.0
+                        local yawRad = math_rad(tYaw + yawOffset)
+                        poolCount = poolCount + 1
+                        local t = targetPool[poolCount]
+                        if not t then t = {}; targetPool[poolCount] = t end
+                        t.col = col; t.r = distRatio
+                        t.s = math_sin(yawRad); t.cs = math_cos(yawRad)
+                        t.isBeacon = true
+                    end
+                end
+            end
+
+            local hasRwr = (#rwrEvents > 0)
+            local hasTargets = (poolCount > 0)
+            local angleDiff = math_abs(getAngleDiff(currentServoAngle, entry.lastSweepDeg))
+            if forceRedraw or angleDiff > 0.5 or frames <= 2 or hasTargets or hasRwr then
+                entry.lastSweepDeg = currentServoAngle
+                pcall(gpuRefreshRadar, entry, isActive, poolCount, targetPool)
+            end
+            sleep(0.05)
+        end
+    end
+end
+
+-- ==========================================
+-- 声纳 GPU 主循环（独立，无IFF/RWR）
+-- ==========================================
+local function asdicGpuUI()
+    if not asdicGpu then return end
+    local w, h = asdicGpu.getSize()
+    local cx = math_floor(w/2)
+    local cy = math_floor(h/2)
+    local r = math_floor(math_min(cx, cy)*0.88)
+    local entry = {gpu = asdicGpu, cx = cx, cy = cy, r = r, w = w, h = h}
+    local frames = 0
+    local lastActive = false
+    local targetPool = {}
+    local poolCount = 0
+    local lastAsdicScanAngle = -9999
+
+    while true do
+        if currentScreenTab == 4 then
+            if asdicGpu then
+                asdicGpu.fill(0x050A05)
+                pcall(asdicGpu.drawText, cx - 6, cy - 4, peripheral.getName(asdicGpu), 0xFFFFFF, 0x050A05, 2)
+                asdicGpu.sync()
+            end
+            sleep(0.3)
+        else
+            frames = frames + 1
+            local isActive = isAsdicActive
+            local forceRedraw = (isActive ~= lastActive)
+            lastActive = isActive
+            poolCount = 0
+            local now = os_clock()
+
+            if localPos and isActive then
+                for _, data in pairs(targets) do
+                    if data.source == 8889 and data.lastPaintedAsdic and not data.isBeacon then
+                        local age = now - data.lastPaintedAsdic
+                        if age < TARGET_FADE_DURATION then
+                            local col = calcFadeColor(age, 0xFF6600)
+                            if col and col ~= 0x000000 then
+                                local screenRad = math_rad(data.paintedYaw)  -- 已经为相对方位
+                                local distRatio = math_min(data.paintedDist / ASDIC_MAX_DISTANCE, 1.0)
+                                poolCount = poolCount + 1
+                                local t = targetPool[poolCount]
+                                if not t then t = {}; targetPool[poolCount] = t end
+                                t.col = col
+                                t.s = math_sin(screenRad)
+                                t.cs = math_cos(screenRad)
+                                t.distRatio = distRatio
+                            end
+                        end
+                    end
+                end
+            end
+
+            local angleDiff = math_abs(getAngleDiff(asdicScanAngle, lastAsdicScanAngle))
+            if forceRedraw or angleDiff > 0.5 or frames <= 2 or poolCount > 0 then
+                lastAsdicScanAngle = asdicScanAngle
+                pcall(refreshAsdic, entry, isActive, poolCount, targetPool)
+            end
+            sleep(0.05)
+        end
+    end
 end
 
 -- ==========================================
@@ -874,7 +1037,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环
+-- 输入事件循环（触摸逻辑与原版一致）
 -- ==========================================
 local function inputLoop()
     local function applyRadarSave()
@@ -1043,6 +1206,7 @@ local function inputLoop()
             end
         elseif (event == "tm_monitor_touch" or event == "tm_monitor_mouse_click") and currentScreenTab <= 3 then
             local touchedName = p1; local mx, my = p2, p3
+            -- 雷达触摸
             if radarGpu and peripheral.getName(radarGpu) == touchedName and localPos and currentRadarRange > 0 and radarEnabled and isServoConnected then
                 local w, h = radarGpu.getSize()
                 local cx, cy = math_floor(w/2), math_floor(h/2)
@@ -1054,7 +1218,7 @@ local function inputLoop()
                 local bestId = nil; local bestDist = nil
                 local now = os_clock()
                 for id, data in pairs(targets) do
-                    if data.lastPainted and not data.isBeacon and (now - data.lastPainted < TARGET_FADE_DURATION) then
+                    if data.source == 8888 and data.lastPainted and not data.isBeacon and (now - data.lastPainted < TARGET_FADE_DURATION) then
                         local yawRad = math_rad(data.paintedYaw + yawOffset)
                         local distRatio = math_min(data.paintedDist/currentRadarRange, 1.0)
                         local px = cx + math_floor(r * distRatio * math_sin(yawRad) + 0.5)
@@ -1069,7 +1233,7 @@ local function inputLoop()
                 end
                 local clickedBeaconId = nil; local beaconSqDist = 16
                 for id, data in pairs(targets) do
-                    if data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
+                    if data.source == 8888 and data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
                         local tYaw = 0
                         if currentQAbs and currentQLoc then
                             local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
@@ -1107,16 +1271,17 @@ local function inputLoop()
                     local bd = targets[clickedBeaconId]
                     bd.iff = (bd.iff == "friendly") and nil or "friendly"
                 end
+            -- 声纳触摸
             elseif asdicGpu and peripheral.getName(asdicGpu) == touchedName and localPos and isAsdicActive then
                 local w, h = asdicGpu.getSize()
                 local cx, cy = math_floor(w/2), math_floor(h/2)
                 local r = math_floor(math_min(cx, cy) * 0.88)
                 local bestId = nil; local bestDist = 99999
                 for _, data in pairs(targets) do
-                    if data.lastPaintedAsdic and not data.isBeacon and data.source == 8889 then
+                    if data.source == 8889 and data.lastPaintedAsdic and not data.isBeacon then
                         local relBearing = data.paintedYaw
                         local screenRad = math_rad(relBearing)
-                        local distRatio = math_min(data.realDist / ASDIC_MAX_DISTANCE, 1.0)
+                        local distRatio = math_min(data.paintedDist / ASDIC_MAX_DISTANCE, 1.0)
                         local px = cx + math_floor(r * distRatio * math_sin(screenRad) + 0.5)
                         local py = cy - math_floor(r * distRatio * math_cos(screenRad) + 0.5)
                         local d2 = (mx - px)^2 + (my - py)^2
@@ -1170,7 +1335,7 @@ local function listenLoop()
             if msg.t==1 then
                 if not targets[msg.i] then targets[msg.i]={id=msg.i} end
                 local t = targets[msg.i]
-                t.source = 8888   -- 强制设置为雷达频道
+                t.source = 8888
                 t.name=msg.n; t.modemDist=dist
                 if msg.x then t.realPos={x=msg.x,y=msg.y,z=msg.z} end
                 t.range=msg.r; t.lastSeen=os_clock(); t.isBeacon=false
@@ -1210,7 +1375,7 @@ local function listenLoop()
                 local key=tostring(beaconId).."_"..beaconUid
                 if not targets[key] then targets[key]={} end
                 local t=targets[key]
-                t.source = 8888   -- 信标也属雷达频道
+                t.source = 8888
                 t.name=tostring(msg.n or ("Beacon-"..beaconId))
                 t.modemDist=dist
                 t.realPos={x=msg.x,y=msg.y,z=msg.z}
@@ -1223,7 +1388,7 @@ local function listenLoop()
             local id = msg.i
             if not targets[id] then targets[id] = {id=id} end
             local t = targets[id]
-            t.source = 8889   -- 强制设置为声纳频道
+            t.source = 8889
             t.name = msg.n
             if msg.x then t.realPos = {x=msg.x, y=msg.y, z=msg.z} end
             t.lastSeen = os_clock(); t.isBeacon = false
@@ -1249,20 +1414,8 @@ local function rwrRedstoneLoop()
     end
 end
 
-local function iffToggleLoop()
-    local lastBack=redstone.getInput("back")
-    while true do
-        os_pullEvent("redstone")
-        local newBack=redstone.getInput("back")
-        if newBack and not lastBack then
-            iffMode=(iffMode=="enemy") and "friendly" or "enemy"
-        end
-        lastBack=newBack
-    end
-end
-
 -- ==========================================
--- 主传感器循环（完全采用原始雷达池构建逻辑）
+-- 主传感器循环（雷达距离公式恢复，不构建池）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1286,9 +1439,8 @@ local function sensorLoop()
                 end
             else isServoConnected = false end
 
-            -- 雷达有效距离公式：min(应力/换算比, 授权最大距离)
+            -- 雷达有效距离公式
             currentRadarRange = math_min(currentStressCapacity / STRESS_TO_DISTANCE_RATIO, MAX_DISTANCE_LIMIT)
-
             isAsdicActive = (currentStressCapacity >= ASDIC_STRESS_THRESHOLD)
 
             -- 摄像头
@@ -1308,92 +1460,38 @@ local function sensorLoop()
             end
 
             local now = os_clock()
-            -- 更新目标距离（供声纳使用）
+            -- 更新目标距离（供声纳等使用）
             for _, t in pairs(targets) do
                 if t.realPos and localPos then t.realDist = calcRangingDist(localPos, t.realPos) end
             end
 
-            -- 雷达目标池构建（完全遵循原始逻辑）
-            radarPoolCount = 0
+            -- 雷达扫描更新（只更新 lastPainted，不构建池）
             if radarEnabled and currentRadarRange > 0 and isServoConnected and localPos then
-                -- 扫描并更新 lastPainted
                 local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
                 local effectiveSW = SCAN_SECTOR_WIDTH + deltaAngle
                 for id, t in pairs(targets) do
-                    if t.source == 8888 and not t.isBeacon then
-                        if t.realPos and t.realDist and t.realDist <= currentRadarRange and t.lastSeen and (now - t.lastSeen < 3.0) then
-                            local tYaw
-                            if currentQAbs and currentQLoc then
-                                local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
-                                local dx = t.realPos.x - localPos.x
-                                local dz = t.realPos.z - localPos.z
-                                local hx,hy,hz = rotateVectorFast(dx, 0, dz, iqx,iqy,iqz,iqw)
-                                local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
-                                tYaw = math_deg(math_atan2(-sx,sz))
-                            else
-                                _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, t.realPos.x,t.realPos.y,t.realPos.z)
-                            end
-                            if math_abs(getAngleDiff(tYaw, currentServoAngle)) <= effectiveSW/2 then
-                                if not t.lastPainted or (now - t.lastPainted >= 0.5) then
-                                    t.paintedYaw = tYaw
-                                    t.paintedDist = t.realDist
-                                    t.lastPainted = now
-                                    if selectedTargetId == t.id and t.iff == "enemy" then
-                                        modem.transmit(CHANNEL, CHANNEL, {v=2, t=2, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-                -- 现在根据 lastPainted 构建池（与原始 rdrGpuUI 完全一致）
-                for _, t in pairs(targets) do
-                    if t.source == 8888 and not t.isBeacon and t.lastPainted then
-                        local age = now - t.lastPainted
-                        if age < TARGET_FADE_DURATION then
-                            local hotColor
-                            if t.iff == "friendly" then hotColor = C.ALLY_HOT
-                            elseif t.iff == "enemy" then hotColor = C.FOE_HOT
-                            else hotColor = C.UNK_HOT end
-                            local col = calcFadeColor(age, hotColor)
-                            if col and col ~= C.BLACK then
-                                local yawRad = math_rad(t.paintedYaw + yawOffset)
-                                local distRatio = math_min(t.paintedDist / currentRadarRange, 1.0)
-                                radarPoolCount = radarPoolCount + 1
-                                local p = radarPool[radarPoolCount]
-                                if not p then p = {}; radarPool[radarPoolCount] = p end
-                                p.col = col; p.r = distRatio
-                                p.s = math_sin(yawRad); p.cs = math_cos(yawRad)
-                                p.isBeacon = false
-                            end
-                        end
-                    end
-                end
-                -- 信标（保持不变）
-                for _, t in pairs(targets) do
-                    if t.source == 8888 and t.isBeacon and t.lastSeen and (now - t.lastSeen < 5.0) and t.realPos then
-                        local col = (t.iff == "friendly") and C.BEACON_ALLY or C.BEACON_UNK
-                        local tYaw = 0
+                    if t.source == 8888 and t.realPos and t.realDist and t.realDist <= currentRadarRange and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
+                        local tYaw
                         if currentQAbs and currentQLoc then
                             local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
                             local dx = t.realPos.x - localPos.x
-                            local dy = t.realPos.y - localPos.y
                             local dz = t.realPos.z - localPos.z
-                            local hx,hy,hz = rotateVectorFast(dx,dy,dz,iqx,iqy,iqz,iqw)
+                            local hx,hy,hz = rotateVectorFast(dx, 0, dz, iqx,iqy,iqz,iqw)
                             local sx,sy,sz = rotateVectorFast(hx,hy,hz, currentQLoc.x,currentQLoc.y,currentQLoc.z,currentQLoc.w)
                             tYaw = math_deg(math_atan2(-sx,sz))
                         else
                             _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, t.realPos.x,t.realPos.y,t.realPos.z)
                         end
-                        local dist = calcRangingDist(localPos, t.realPos) or 0
-                        local distRatio = (currentRadarRange > 0) and math_min(dist/currentRadarRange, 1.0) or 1.0
-                        local yawRad = math_rad(tYaw + yawOffset)
-                        radarPoolCount = radarPoolCount + 1
-                        local p = radarPool[radarPoolCount]
-                        if not p then p = {}; radarPool[radarPoolCount] = p end
-                        p.col = col; p.r = distRatio
-                        p.s = math_sin(yawRad); p.cs = math_cos(yawRad)
-                        p.isBeacon = true
+                        if math_abs(getAngleDiff(tYaw, currentServoAngle)) <= effectiveSW/2 then
+                            if not t.lastPainted or (now - t.lastPainted >= 0.5) then
+                                t.paintedYaw = tYaw
+                                t.paintedDist = t.realDist
+                                t.lastPainted = now
+                                if selectedTargetId == t.id and t.iff == "enemy" then
+                                    modem.transmit(CHANNEL, CHANNEL, {v=2, t=2, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -1425,18 +1523,7 @@ local function sensorLoop()
                 pcall(applyCameraAngle, holdPitch, holdYaw)
             end
 
-            -- 声纳扫描线
-            local asdicElapsed = now - asdicScanStart
-            local period = 4 * ASDIC_SCAN_SECTOR_HALF / ASDIC_SCAN_ANGULAR_SPEED
-            local phase = (asdicElapsed % period) / period
-            if phase < 0.5 then
-                asdicScanAngle = -ASDIC_SCAN_SECTOR_HALF + 4 * ASDIC_SCAN_SECTOR_HALF * phase
-            else
-                asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
-            end
-
-            -- 声纳目标池
-            asdicPoolCount = 0
+            -- 声纳扫描更新（只更新 lastPaintedAsdic）
             if isAsdicActive and localPos then
                 local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
                 for id, t in pairs(targets) do
@@ -1463,21 +1550,20 @@ local function sensorLoop()
                                     t.lastPaintedAsdic = now
                                     modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, {v=2, t=3, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
                                 end
-                                local age = now - t.lastPaintedAsdic
-                                local col = calcFadeColor(age, 0xFF6600)
-                                if col and col ~= 0x000000 then
-                                    asdicPoolCount = asdicPoolCount + 1
-                                    local p = asdicTargetPool[asdicPoolCount]
-                                    if not p then p = {}; asdicTargetPool[asdicPoolCount] = p end
-                                    p.col = col
-                                    local screenRad = math_rad(relBearing)
-                                    p.s = math_sin(screenRad); p.cs = math_cos(screenRad)
-                                    p.distRatio = math_min(t.realDist / ASDIC_MAX_DISTANCE, 1.0)
-                                end
                             end
                         end
                     end
                 end
+            end
+
+            -- 声纳扫描线角度更新
+            local asdicElapsed = now - asdicScanStart
+            local period = 4 * ASDIC_SCAN_SECTOR_HALF / ASDIC_SCAN_ANGULAR_SPEED
+            local phase = (asdicElapsed % period) / period
+            if phase < 0.5 then
+                asdicScanAngle = -ASDIC_SCAN_SECTOR_HALF + 4 * ASDIC_SCAN_SECTOR_HALF * phase
+            else
+                asdicScanAngle = ASDIC_SCAN_SECTOR_HALF - 4 * ASDIC_SCAN_SECTOR_HALF * (phase - 0.5)
             end
         end
         sleep(0.02)
@@ -1490,7 +1576,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.0.2 - OK")
+print("Radar+ASDIC v4.1.0 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
@@ -1504,33 +1590,8 @@ sleep(1.0)
 -- 并行协程
 -- ==========================================
 parallel.waitForAll(
-    function() -- 雷达GPU
-        while true do
-            if radarGpu then
-                local w,h = radarGpu.getSize()
-                local cx,cy = math_floor(w/2), math_floor(h/2)
-                local r = math_floor(math_min(cx,cy)*0.88)
-                local ds = 4
-                if r<80 then ds=3 end
-                if r<50 then ds=2 end
-                local entry = {gpu=radarGpu, cx=cx, cy=cy, r=r, w=w, h=h, dotSize=ds}
-                gpuRefreshRadar(entry, radarEnabled and currentRadarRange>0 and isServoConnected, radarPoolCount, radarPool)
-            end
-            sleep(0.05)
-        end
-    end,
-    function() -- 声纳GPU
-        while true do
-            if asdicGpu then
-                local w,h = asdicGpu.getSize()
-                local cx,cy = math_floor(w/2), math_floor(h/2)
-                local r = math_floor(math_min(cx,cy)*0.88)
-                local entry = {gpu=asdicGpu, cx=cx, cy=cy, r=r, w=w, h=h}
-                refreshAsdic(entry, isAsdicActive, asdicPoolCount, asdicTargetPool)
-            end
-            sleep(0.05)
-        end
-    end,
+    rdrGpuUI,               -- 雷达GPU（原始逻辑）
+    asdicGpuUI,             -- 声纳GPU（独立）
     function() while true do drawRadarHUD() sleep(0.1) end end,
     function() while true do drawAsdicHUD() sleep(0.1) end end,
     termUI,
@@ -1538,6 +1599,5 @@ parallel.waitForAll(
     pingLoop,
     listenLoop,
     rwrRedstoneLoop,
-    iffToggleLoop,
     sensorLoop
 )
