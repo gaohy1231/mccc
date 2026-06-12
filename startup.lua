@@ -1,19 +1,18 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.1.1
+雷达 + 主动声纳 二合一系统   v4.1.2
 修复：
-- 分配 GPU 时调用 setSize(64)，确保字体大小与原始雷达一致
-- 雷达 GPU 主循环完全恢复原始逻辑（帧计数、IFF检测、池内构建）
-- 声纳 GPU 主循环独立（无IFF、无RWR，池内构建）
-- 雷达仅显示 8888 目标，声纳仅显示 8889 目标
-- 雷达距离 = min(应力/换算比, 授权最大值)
+- GPU 字体大小正常（通过 setSize(64) 初始化）
+- 雷达目标显示正常（使用 source==8888 和 lastPainted 构建池）
+- 主动声纳航向对称修正（headingOffset 参数）
+- 雷达距离公式：min(应力/换算比, 授权最大值)
 - 速度过滤仅水听使用，雷达/声纳不使用
 ======================================================================]]
 
 -- ==========================================
 --  全局配置（雷达原版参数）
 -- ==========================================
-local MAX_DISTANCE_LIMIT       = 5000.0          -- 最大探测距离（可由注册机覆盖）
-local STRESS_TO_DISTANCE_RATIO = 2.0             -- 应力到距离的转换比
+local MAX_DISTANCE_LIMIT       = 5000.0
+local STRESS_TO_DISTANCE_RATIO = 2.0
 local CHANNEL                  = 8888
 local ACTIVE_SONAR_CHANNEL     = 8889
 local SCAN_SECTOR_WIDTH        = 20
@@ -332,7 +331,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.1.1 - Registration Check")
+    print("Radar+ASDIC v4.1.2 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -653,6 +652,7 @@ local function drawAsdicSector(entry)
             end
         end
     end
+    -- 声纳使用独立航向修正（解决对称问题）
     local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
     local dirs = {
         {angle=0,   label="N"},
@@ -726,7 +726,7 @@ local function rdrGpuUI()
             local now = os_clock()
 
             if localPos and isActive then
-                -- 普通目标（非信标）
+                -- 普通目标（非信标），仅包含 8888 频道
                 for _, data in pairs(targets) do
                     if data.source == 8888 and data.lastPainted and not data.isBeacon then
                         local age = now - data.lastPainted
@@ -1595,7 +1595,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.1.1 - OK")
+print("Radar+ASDIC v4.1.2 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
