@@ -1,10 +1,10 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.1.3
-- 雷达显示所有目标（移除 source==8888 限制）
-- 声纳只显示 8889 频道目标
-- 声纳航向对称修正：使用 headingOffset 参数
+雷达 + 主动声纳 二合一系统   v4.1.4
+修复：
+- 雷达可扫描所有目标（不再限制频道）
+- 主动声纳增加航向对称修正参数 (Heading Sym Offset)
 - 雷达距离公式：min(应力/换算比, 授权最大值)
-- 界面字体修复、目标淡出、IFF、RWR 等完整保留
+- 界面字体正常、目标淡出、IFF、RWR 等完整保留
 ======================================================================]]
 
 -- ==========================================
@@ -117,7 +117,7 @@ local currentServoAngle        = 0
 local isServoConnected         = false
 local yawOffset    = 0
 local motorOffset  = 0
-local headingOffset = 0       -- 声纳航向对称偏移
+local headingOffset = 0       -- 主动声纳航向对称偏移
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
@@ -329,7 +329,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.1.3 - Registration Check")
+    print("Radar+ASDIC v4.1.4 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -928,7 +928,7 @@ local function drawAsdicHUD()
 end
 
 -- ==========================================
--- 终端 UI 四页（对称修正提示）
+-- 终端 UI 四页（对称修正参数在声纳页）
 -- ==========================================
 local function drawInputBox(y, label, val, isSel, isEdit)
     term.setCursorPos(2,y); term.setBackgroundColor(colors.black)
@@ -963,7 +963,7 @@ local function termUI()
         elseif currentScreenTab == 2 then
             term.setCursorPos(2,3); term.setTextColor(colors.yellow)
             term.write("=== ASDIC PARAMETERS ===")
-            drawInputBox(5, "Heading Sym Offset:", headingOffset, menuIndex==1, isEditing)
+            drawInputBox(5, "Heading Sym  :", headingOffset, menuIndex==1, isEditing)
             drawInputBox(7, "Scan Speed   :", string.format("%.1f deg/s", ASDIC_SCAN_ANGULAR_SPEED), menuIndex==2, isEditing)
             drawInputBox(9, "Broadcast Pos:", broadcastOwnPos and "yes" or "no", menuIndex==3, isEditing)
         elseif currentScreenTab == 3 then
@@ -1432,7 +1432,7 @@ local function rwrRedstoneLoop()
 end
 
 -- ==========================================
--- 主传感器循环（雷达扫描所有目标）
+-- 主传感器循环（雷达扫描所有目标，声纳使用对称修正）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1537,7 +1537,7 @@ local function sensorLoop()
                 pcall(applyCameraAngle, holdPitch, holdYaw)
             end
 
-            -- 声纳扫描更新（仅8889频道）
+            -- 声纳扫描更新（仅8889频道，使用对称修正航向）
             if isAsdicActive and localPos then
                 local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
                 for id, t in pairs(targets) do
@@ -1589,7 +1589,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.1.3 - OK")
+print("Radar+ASDIC v4.1.4 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
