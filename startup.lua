@@ -1,10 +1,9 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.1.0
+雷达 + 主动声纳 二合一系统   v4.1.1
 修复：
-- 雷达 GPU 主循环恢复原始 rdrGpuUI 逻辑（帧计数、IFF检测、池内构建）
+- 分配 GPU 时调用 setSize(64)，确保字体大小与原始雷达一致
+- 雷达 GPU 主循环完全恢复原始逻辑（帧计数、IFF检测、池内构建）
 - 声纳 GPU 主循环独立（无IFF、无RWR，池内构建）
-- 修复雷达字体异常（恢复原始 scale 参数）
-- 目标点颜色与锁定行为与原始雷达一致（热力色淡出，锁定变红）
 - 雷达仅显示 8888 目标，声纳仅显示 8889 目标
 - 雷达距离 = min(应力/换算比, 授权最大值)
 - 速度过滤仅水听使用，雷达/声纳不使用
@@ -118,15 +117,15 @@ local selectedTargetDistStr = nil
 local currentQAbs, currentQLoc = nil, nil
 local currentServoAngle        = 0
 local isServoConnected         = false
-local yawOffset    = 0                -- 雷达显示偏移
-local motorOffset  = 0                -- 雷达伺服零点偏移
-local headingOffset = 0               -- 主动声纳航向偏移
+local yawOffset    = 0
+local motorOffset  = 0
+local headingOffset = 0
 local myLabel      = os.getComputerLabel() or ("Entity-" .. myId)
 local monitorModes = {}
 local aimPrecision = 5
 local currentStressCapacity = 0
 local currentRadarRange     = 0
-local currentNorthYawDeg    = 0      -- 摄像头原始航向
+local currentNorthYawDeg    = 0
 local currentScreenTab      = 1      -- 1=雷达参数, 2=声纳参数, 3=状态, 4=设备
 local menuIndex             = 1
 local isEditing             = false
@@ -157,7 +156,6 @@ local asdicGpu = nil
 local radarHud = nil
 local asdicHud = nil
 
-local ROLES = {"none", "radarGpu", "asdicGpu", "radarHud", "asdicHud"}
 local ROLE_LABELS = {
     none = "Unassigned",
     radarGpu = "Radar GPU",
@@ -166,7 +164,6 @@ local ROLE_LABELS = {
     asdicHud = "ASDIC HUD"
 }
 
--- 收集外设
 for _, name in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(name)
     if ptype == "tm_gpu" then table.insert(allGpus, name)
@@ -204,26 +201,48 @@ local function applyDeviceMap()
     radarGpu = nil; asdicGpu = nil; radarHud = nil; asdicHud = nil
     for _, name in ipairs(allGpus) do
         local role = deviceMap[name]
-        if role == "radarGpu" then radarGpu = peripheral.wrap(name)
-        elseif role == "asdicGpu" then asdicGpu = peripheral.wrap(name) end
+        if role == "radarGpu" then
+            radarGpu = peripheral.wrap(name)
+            pcall(radarGpu.refreshSize)
+            pcall(radarGpu.setSize, 64)     -- ★ 设置正确像素密度，避免字体过大
+        elseif role == "asdicGpu" then
+            asdicGpu = peripheral.wrap(name)
+            pcall(asdicGpu.refreshSize)
+            pcall(asdicGpu.setSize, 64)
+        end
     end
     for _, name in ipairs(allMons) do
         local role = deviceMap[name]
-        if role == "radarHud" then radarHud = peripheral.wrap(name); radarHud.setTextScale(1)
-        elseif role == "asdicHud" then asdicHud = peripheral.wrap(name); asdicHud.setTextScale(1) end
+        if role == "radarHud" then
+            radarHud = peripheral.wrap(name)
+            radarHud.setTextScale(1)
+        elseif role == "asdicHud" then
+            asdicHud = peripheral.wrap(name)
+            asdicHud.setTextScale(1)
+        end
     end
     -- 自动分配未指定的
     if not radarGpu and #allGpus >= 1 and not deviceMap[allGpus[1]] then
-        deviceMap[allGpus[1]] = "radarGpu"; radarGpu = peripheral.wrap(allGpus[1])
+        deviceMap[allGpus[1]] = "radarGpu"
+        radarGpu = peripheral.wrap(allGpus[1])
+        pcall(radarGpu.refreshSize)
+        pcall(radarGpu.setSize, 64)
     end
     if not asdicGpu and #allGpus >= 2 and not deviceMap[allGpus[2]] then
-        deviceMap[allGpus[2]] = "asdicGpu"; asdicGpu = peripheral.wrap(allGpus[2])
+        deviceMap[allGpus[2]] = "asdicGpu"
+        asdicGpu = peripheral.wrap(allGpus[2])
+        pcall(asdicGpu.refreshSize)
+        pcall(asdicGpu.setSize, 64)
     end
     if not radarHud and #allMons >= 1 and not deviceMap[allMons[1]] then
-        deviceMap[allMons[1]] = "radarHud"; radarHud = peripheral.wrap(allMons[1]); radarHud.setTextScale(1)
+        deviceMap[allMons[1]] = "radarHud"
+        radarHud = peripheral.wrap(allMons[1])
+        radarHud.setTextScale(1)
     end
     if not asdicHud and #allMons >= 2 and not deviceMap[allMons[2]] then
-        deviceMap[allMons[2]] = "asdicHud"; asdicHud = peripheral.wrap(allMons[2]); asdicHud.setTextScale(1)
+        deviceMap[allMons[2]] = "asdicHud"
+        asdicHud = peripheral.wrap(allMons[2])
+        asdicHud.setTextScale(1)
     end
     saveDeviceMap()
 end
@@ -313,7 +332,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.1.0 - Registration Check")
+    print("Radar+ASDIC v4.1.1 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -1576,7 +1595,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.1.0 - OK")
+print("Radar+ASDIC v4.1.1 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
