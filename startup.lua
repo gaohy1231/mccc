@@ -1,10 +1,13 @@
 --[[
-雷达 + 主动声纳 二合一系统   v4.1.4
-修复：
-- 雷达可扫描所有目标（不再限制频道）
-- 主动声纳增加航向对称修正参数 (Heading Sym Offset)
+雷达 + 主动声纳 二合一系统   v4.1.5
+修正：
+- 声纳方向字母绘制错误（移除多余的 +180° 偏移）
+- 声纳目标点使用相对船首方位绘制
+- 声纳航向对称修正参数 (Heading Sym Offset) 在 UI 中可编辑
+- 雷达只显示 8888 频道目标
+- 声纳只显示 8889 频道目标
 - 雷达距离公式：min(应力/换算比, 授权最大值)
-- 界面字体正常、目标淡出、IFF、RWR 等完整保留
+- 字体正常、目标淡出、IFF、RWR 等完整保留
 ======================================================================]]
 
 -- ==========================================
@@ -329,7 +332,7 @@ local function checkRegistration()
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.cyan)
-    print("Radar+ASDIC v4.1.4 - Registration Check")
+    print("Radar+ASDIC v4.1.5 - Registration Check")
     term.setTextColor(colors.white)
     print(string.format("My ID: %d", myId))
     print("Querying scanner...")
@@ -607,7 +610,7 @@ local function gpuRefreshRadar(entry,isActive,poolCount,pool)
 end
 
 -- ==========================================
--- 声纳 GPU 绘制函数（航向对称修正）
+-- 声纳 GPU 绘制函数（修正航向对称问题）
 -- ==========================================
 local function drawAsdicSector(entry)
     local g = entry.gpu; local cx = entry.cx; local cy = entry.cy; local r = entry.r
@@ -650,8 +653,8 @@ local function drawAsdicSector(entry)
             end
         end
     end
-    -- 声纳航向对称修正：使用 headingOffset
-    local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
+    -- 方向字母修正：不再加180°，直接使用航向偏移
+    local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
     local dirs = {
         {angle=0,   label="N"},
         {angle=90,  label="E"},
@@ -688,7 +691,7 @@ local function refreshAsdic(entry, isActive, poolCount, pool)
 end
 
 -- ==========================================
--- 雷达 GPU 主循环（显示所有目标）
+-- 雷达 GPU 主循环（显示 8888 目标）
 -- ==========================================
 local function rdrGpuUI()
     if not radarGpu then return end
@@ -724,9 +727,9 @@ local function rdrGpuUI()
             local now = os_clock()
 
             if localPos and isActive then
-                -- 显示所有非信标目标（不限制频道）
+                -- 显示 8888 频道目标
                 for _, data in pairs(targets) do
-                    if data.lastPainted and not data.isBeacon then
+                    if data.source == 8888 and data.lastPainted and not data.isBeacon then
                         local age = now - data.lastPainted
                         if age < TARGET_FADE_DURATION then
                             local hotColor
@@ -749,7 +752,7 @@ local function rdrGpuUI()
                 end
                 -- 信标
                 for _, data in pairs(targets) do
-                    if data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
+                    if data.source == 8888 and data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
                         local col = (data.iff == "friendly") and C.BEACON_ALLY or C.BEACON_UNK
                         local tYaw = 0
                         if currentQAbs and currentQLoc then
@@ -821,14 +824,14 @@ local function asdicGpuUI()
             local now = os_clock()
 
             if localPos and isActive then
-                -- 仅显示 8889 频道目标
+                -- 仅显示 8889 频道目标（paintedYaw 已是相对船首方位）
                 for _, data in pairs(targets) do
                     if data.source == 8889 and data.lastPaintedAsdic and not data.isBeacon then
                         local age = now - data.lastPaintedAsdic
                         if age < TARGET_FADE_DURATION then
                             local col = calcFadeColor(age, 0xFF6600)
                             if col and col ~= 0x000000 then
-                                local screenRad = math_rad(data.paintedYaw)
+                                local screenRad = math_rad(data.paintedYaw)   -- 直接使用相对方位
                                 local distRatio = math_min(data.paintedDist / ASDIC_MAX_DISTANCE, 1.0)
                                 poolCount = poolCount + 1
                                 local t = targetPool[poolCount]
@@ -1054,7 +1057,7 @@ local function termUI()
 end
 
 -- ==========================================
--- 输入事件循环（雷达触摸不限制频道）
+-- 输入事件循环
 -- ==========================================
 local function inputLoop()
     local function applyRadarSave()
@@ -1223,7 +1226,7 @@ local function inputLoop()
             end
         elseif (event == "tm_monitor_touch" or event == "tm_monitor_mouse_click") and currentScreenTab <= 3 then
             local touchedName = p1; local mx, my = p2, p3
-            -- 雷达触摸（不限制频道）
+            -- 雷达触摸（仅8888频道）
             if radarGpu and peripheral.getName(radarGpu) == touchedName and localPos and currentRadarRange > 0 and radarEnabled and isServoConnected then
                 local w, h = radarGpu.getSize()
                 local cx, cy = math_floor(w/2), math_floor(h/2)
@@ -1235,7 +1238,7 @@ local function inputLoop()
                 local bestId = nil; local bestDist = nil
                 local now = os_clock()
                 for id, data in pairs(targets) do
-                    if data.lastPainted and not data.isBeacon and (now - data.lastPainted < TARGET_FADE_DURATION) then
+                    if data.source == 8888 and data.lastPainted and not data.isBeacon and (now - data.lastPainted < TARGET_FADE_DURATION) then
                         local yawRad = math_rad(data.paintedYaw + yawOffset)
                         local distRatio = math_min(data.paintedDist/currentRadarRange, 1.0)
                         local px = cx + math_floor(r * distRatio * math_sin(yawRad) + 0.5)
@@ -1250,7 +1253,7 @@ local function inputLoop()
                 end
                 local clickedBeaconId = nil; local beaconSqDist = 16
                 for id, data in pairs(targets) do
-                    if data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
+                    if data.source == 8888 and data.isBeacon and data.lastSeen and (now - data.lastSeen < 5.0) and data.realPos then
                         local tYaw = 0
                         if currentQAbs and currentQLoc then
                             local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
@@ -1296,7 +1299,7 @@ local function inputLoop()
                 local bestId = nil; local bestDist = 99999
                 for _, data in pairs(targets) do
                     if data.source == 8889 and data.lastPaintedAsdic and not data.isBeacon then
-                        local relBearing = data.paintedYaw
+                        local relBearing = data.paintedYaw   -- 相对船首
                         local screenRad = math_rad(relBearing)
                         local distRatio = math_min(data.paintedDist / ASDIC_MAX_DISTANCE, 1.0)
                         local px = cx + math_floor(r * distRatio * math_sin(screenRad) + 0.5)
@@ -1432,7 +1435,7 @@ local function rwrRedstoneLoop()
 end
 
 -- ==========================================
--- 主传感器循环（雷达扫描所有目标，声纳使用对称修正）
+-- 主传感器循环（雷达扫描8888，声纳使用对称修正航向）
 -- ==========================================
 local function sensorLoop()
     local lastServoAngle = nil
@@ -1479,12 +1482,12 @@ local function sensorLoop()
                 if t.realPos and localPos then t.realDist = calcRangingDist(localPos, t.realPos) end
             end
 
-            -- 雷达扫描所有目标
+            -- 雷达扫描8888目标
             if radarEnabled and currentRadarRange > 0 and isServoConnected and localPos then
                 local deltaAngle = lastServoAngle and math_abs(getAngleDiff(currentServoAngle, lastServoAngle)) or 0
                 local effectiveSW = SCAN_SECTOR_WIDTH + deltaAngle
                 for id, t in pairs(targets) do
-                    if t.realPos and t.realDist and t.realDist <= currentRadarRange and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
+                    if t.source == 8888 and t.realPos and t.realDist and t.realDist <= currentRadarRange and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
                         local tYaw
                         if currentQAbs and currentQLoc then
                             local iqx,iqy,iqz,iqw = quatInverse(currentQAbs.x,currentQAbs.y,currentQAbs.z,currentQAbs.w)
@@ -1537,9 +1540,9 @@ local function sensorLoop()
                 pcall(applyCameraAngle, holdPitch, holdYaw)
             end
 
-            -- 声纳扫描更新（仅8889频道，使用对称修正航向）
+            -- 声纳扫描更新（仅8889频道，使用对称修正航向计算相对方位）
             if isAsdicActive and localPos then
-                local effectiveHeading = (currentNorthYawDeg + headingOffset + 180) % 360
+                local effectiveHeading = (currentNorthYawDeg + headingOffset) % 360
                 for id, t in pairs(targets) do
                     if t.source == 8889 and t.realPos and t.realDist and t.realDist >= ASDIC_MIN_DISTANCE and t.realDist <= ASDIC_MAX_DISTANCE
                         and t.realPos.y <= ASDIC_DEPTH_FILTER and not t.isBeacon and t.lastSeen and (now - t.lastSeen < 3.0) then
@@ -1554,12 +1557,13 @@ local function sensorLoop()
                         else
                             _,tYaw = calculateLookAngles(localPos.x,localPos.y,localPos.z, t.realPos.x,t.realPos.y,t.realPos.z)
                         end
+                        -- 相对船首方位
                         local relBearing = getAngleDiff(tYaw, effectiveHeading)
                         if math_abs(relBearing) <= ASDIC_SCAN_SECTOR_HALF then
                             local beamHalf = ASDIC_SCAN_BEAM_WIDTH / 2
                             if math_abs(getAngleDiff(relBearing, asdicScanAngle)) <= beamHalf then
                                 if not t.lastPaintedAsdic or (now - t.lastPaintedAsdic >= 0.5) then
-                                    t.paintedYaw = relBearing
+                                    t.paintedYaw = relBearing   -- 存储相对方位
                                     t.paintedDist = t.realDist
                                     t.lastPaintedAsdic = now
                                     modem.transmit(ACTIVE_SONAR_CHANNEL, ACTIVE_SONAR_CHANNEL, {v=2, t=3, si=myId, ti=id, x=localPos.x, y=localPos.y, z=localPos.z})
@@ -1589,7 +1593,7 @@ end
 term.clear()
 term.setCursorPos(1,1)
 term.setTextColor(colors.green)
-print("Radar+ASDIC v4.1.4 - OK")
+print("Radar+ASDIC v4.1.5 - OK")
 print(string.format("  Name      : %s", myLabel))
 print(string.format("  Radar Range: %.0f m", MAX_DISTANCE_LIMIT))
 print(string.format("  ASDIC Range: %d-%d m", ASDIC_MIN_DISTANCE, ASDIC_MAX_DISTANCE))
